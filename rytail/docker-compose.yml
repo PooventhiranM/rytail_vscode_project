@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rytail_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:///./rytail.db
+      - SECRET_KEY=rytail_production_secret_key_2026
+    volumes:
+      - ./backend/rytail.db:/app/rytail.db
+    restart: always
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: rytail_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: always

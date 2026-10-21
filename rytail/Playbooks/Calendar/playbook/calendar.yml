@@ -1,0 +1,579 @@
+playbook_id: "REPL-CAL-01"
+playbook_name: "Calendar Plan Configuration Agent — Replenishment"
+short_name: "calendar_plan_config"
+
+description: >
+  Handles Create / Use-existing / Edit-existing / Clone-from-reference for
+  Calendar Plans via chat, PLUS the Store & SKU level Minimum Display
+  mapping upload (G5). This playbook's scope is deliberately just these
+  two things — Calendar Plan CRUD and the min-display mapping upload; the
+  actual eligibility computation (Sales Threshold rule, MinDisplay logic,
+  output) is intentionally OUT of scope here — it lives in the sibling
+  Replenishment/ folder instead (Replenishment/Playbook/eligibility.yml,
+  REPL-ELIG-01; not this file). That playbook's scheduling/scope-isolation
+  architecture is built; the actual eligibility rules are still TBD there. A
+  Calendar Plan is a JSON config object (planName, warehouse,
+  productFamily, runCadence, status, storeMappingFileId) that gates which
+  store+product+size rows Replenishment runs against. Four distinct paths
+  from G1:
+    - create_new (G2A): brand-new plan, brand-new planName.
+    - use_existing (G2B): READ-ONLY — select, confirm as-is. Nothing
+      written to Domo.
+    - edit_existing (G2D): genuine IN-PLACE edit of an already-saved plan
+      — warehouse / productFamily / runCadence / status are all editable;
+      planName is NOT (edit never renames a plan — use
+      clone_from_reference for a differently-named copy), and its mapping
+      file is NOT touched by this gate (see G2D.out_of_scope).
+    - clone_from_reference (G2C): pre-fill from an existing plan, edit
+      freely, but planName is REQUIRED to be new — always produces a
+      brand-new plan, never modifies the reference.
+  create_new, edit_existing, and clone_from_reference all funnel into G4,
+  the one confirm-and-write gate (edit_existing skips G3 — see below).
+  G5 (Store & SKU Minimum Display mapping upload) is INDEPENDENT of the
+  G1 menu — it's OPT-IN, triggered only by the user's own wording (see
+  G5.when), not offered as a standing menu option or automatic follow-up
+  to anything above.
+
+  MODULE SEPARATION (critical): this playbook lives in the Replenishment
+  module, which has its OWN .env and its OWN MCP tool surface, entirely
+  separate from the First Allocation module's .env/MCP even though both
+  point at the same Domo instance. This playbook must NEVER resolve a
+  dataset ID from an FA-scoped tool (e.g. get_fa_dataset_ids), and must
+  never assume a dataset name/ID that "sounds right" without confirming it
+  through a Replenishment-scoped lookup or a live search_dataset/
+  list_datasets call.
+
+  There is no dedicated pipeline tool for this yet: YOU (the agent) build
+  and run every query yourself with the generic query_dataset /
+  write_to_domo_dataset / create_domo_dataset tools, following the exact
+  gates, validation rules, and schema in this file.
+
+# ── Schema discovery — gate G0, before anything else ──
+schema_discovery:
+  step_1_confirmed_existing_datasets: >
+    These 7 datasets were verified live against the Domo instance
+    (gwcteq-partner.domo.com) and their IDs are confirmed as of this
+    playbook's authoring — use them directly, no lookup tool needed for
+    these specific 7:
+      - store_master        → SU_Store_Master        → 6469d8b2-ff81-4e20-9554-39245e744ff9
+      - product_master       → SU_Product_Master       → 7fb59cab-dd64-4821-a55f-2276d808bfc3
+      - store_invdetails     → SU_Store_Invdetails     → c4acfdfb-e9c8-4bd6-97e1-9ad4c85eedc2
+      - warehouse_invdetails → SU_Warehouse_Invdetails → d5b5b9f9-614f-447a-9cb9-4653fd82af6d
+      - WMS Data → DEV|OUT|Wms Order Life Cycle → 606fc25f-7e95-40d8-abd9-544e6970560a
+      - calendar_plans → Calendar Plans → a21b4d4b-6edd-4a02-b2e3-d87ba71045ff
+      - store_sku_min_display_mapping → Store_Sku_Min_Display_mapping → 2ee08d66-2eec-43af-a711-a7505a325629
+        (used by THIS playbook's G5 — REPLACED wholesale, not appended to,
+        and only when the user opts in — see gates.G5.when)
+
+
+    IDs can drift (renamed/recreated dataset) — if a query against one of
+    these fails on a missing table/ID, re-confirm with search_dataset
+    before assuming the playbook's hardcoded ID is stale.
+  step_2_calendar_plans_created: >
+    RESOLVED — calendar_plans was created in Domo (via create_domo_dataset,
+    REPL-CAL-01 G4's first-ever-plan path) and its ID is now registered in
+    DOMO_CALENDAR_PLANS_DATASET_ID / MODULE_DATASETS["replenishment"], and
+    listed in step_1 above. It remains a SINGLE shared dataset (one
+    physical Domo dataset for ALL calendar plans, rows distinguished by
+    planName + rowSeq) — see datasets.calendar_plans below. It is never
+    recreated; every G4 save from now on is write_to_domo_dataset against
+    this same ID. store_mapping, by contrast, is NOT one shared dataset:
+    see datasets.store_mapping.status for its per-plan design.
+  step_3_create_dataset_tool_available: >
+    RESOLVED — create_domo_dataset exists (mcp_sever 1.py, role required:
+    deployer). It creates a brand-new Domo dataset from a file/CSV/rows and
+    uploads the data in one call (dry run by default; confirm=True to
+    actually create). It's what created calendar_plans (step_2 above), and
+    is used per-plan for store_mapping — see datasets.store_mapping.status
+    and G3/G4 below for that flow.
+  step_4: >
+    Call inspect_schema ONCE with all 7 confirmed IDs from step_1
+    comma-separated — they're fetched in parallel. Hold column lists in
+    context for the rest of the conversation. A plan's own store_mapping
+    dataset (once it
+    exists, from calendar_plans.storeMappingFileId) is inspected
+    separately, on demand, when that specific plan is opened — its schema
+    isn't known upfront the way the shared datasets are. Re-inspect a
+    dataset later ONLY if a query fails on a specific missing column
+    (schema drift).
+  sql_safety: "Double any embedded single quotes in interpolated values (planName, warehouse code, etc.) before building SQL."
+
+# ── Datasets ──
+datasets:
+  # ── Confirmed existing, Replenishment-relevant, IDs known ──
+  store_master:
+    alias: "store_master"
+    domo_dataset_name: "SU_Store_Master"
+    confirmed_id: "6469d8b2-ff81-4e20-9554-39245e744ff9"
+    grain: "one row per StoreCode"
+    relevant_columns: ["StoreCode", "StoreName", "Format", "Replenishment LeadTime",
+      "Cluster", "Tier", "Store Group", "Store Status Name"]
+    usage_in_this_playbook: >
+      Source for the Warehouse dropdown at G2A/G2D (Format = 'Warehouse',
+      confirmed real value — other Format values seen: 'Mall', 'High
+      Street'). Also the SYSTEM OF RECORD for per-store Replenishment Lead
+      Time. Note the real store-mapping upload DOES carry its own LeadTime
+      column (see datasets.store_mapping) — that is a merchandiser
+      override to be stored and delta-flagged against this dataset, never
+      a replacement for it. "Planning Horizon" remains the genuinely
+      plan-specific value, not present anywhere in existing data.
+      Cluster (values A/B/C, confirmed) is the
+      likely candidate for "Group A stores" — UNCONFIRMED with Parag,
+      still needs sign-off before treating cluster='A' as equivalent to
+      Group A.
+  product_master:
+    alias: "product_master"
+    domo_dataset_name: "SU_Product_Master"
+    confirmed_id: "7fb59cab-dd64-4821-a55f-2276d808bfc3"
+    grain: "one row per product Reference + Size"
+    relevant_columns: ["Reference", "Size", "Division", "Family"]
+    usage_in_this_playbook: >
+      Source for the Product Family dropdown at G2A/G2D: SELECT DISTINCT
+      Family FROM table WHERE Division <> 'NSM'. Division values confirmed
+      live: NSM, SOR APPAREL, BO APPAREL, BO NON APP, SOR NON APP, SOCKS,
+      MENS WEAR, WOMENS WESTERNWEAR, WOMENS SLEEP AND INTIMATES, KIDS
+      WEAR, WOMENS ETHNICWEAR, NON APP. 'NSM' is excluded per this
+      requirement; no further filtering confirmed beyond that.
+  product_performance:
+    alias: "product_performance"
+    domo_dataset_name: "DEV|OUT|Rytail Product Performance"
+    confirmed_id: "ff243d9a-1d5f-42d9-b2d4-44847df66ff2"
+    grain: "storeCode + reference + sizeWise, per transactionDate"
+    relevant_columns: ["storeCode", "reference", "sizeWise", "stockOnhandQty",
+      "gitQty", "warehouseStockOnhandQty", "replenishmentLeadTime",
+      "cluster", "tier", "transactionDate", "saleQty", "tillDateSaleQty",
+      "sellThru%", "ros%"]
+    usage_in_this_playbook: >
+      Not queried during the Calendar Plan config flow (G1–G5) — this is
+      the eligibility/quantity pipeline's dataset (Store Stock =
+      stockOnhandQty, Transit Stock = gitQty, Warehouse Stock =
+      warehouseStockOnhandQty). Listed here because it's the Replenishment
+      module's primary transactional dataset — the actual eligibility
+      computation that depends on it is intentionally out of scope for
+      this playbook (see top-level description); it lives in
+      Replenishment/Playbook/eligibility.yml instead.
+  store_invdetails:
+    alias: "store_invdetails"
+    domo_dataset_name: "SU_Store_Invdetails"
+    confirmed_id: "c4acfdfb-e9c8-4bd6-97e1-9ad4c85eedc2"
+    grain: "DATE + STORE_CODE + PRODUCT_CODE"
+    relevant_columns: ["DATE", "STORE_CODE", "PRODUCT_CODE", "STOCK_ONHAND_QTY", "GIT_QTY"]
+    usage_in_this_playbook: >
+      Not queried during G1–G4. Raw store-level stock ledger, likely the
+      source feed rolling up into product_performance's aggregated
+      columns — relevant to the quantity-calc playbook, not this one.
+  warehouse_invdetails:
+    alias: "warehouse_invdetails"
+    domo_dataset_name: "SU_Warehouse_Invdetails"
+    confirmed_id: "d5b5b9f9-614f-447a-9cb9-4653fd82af6d"
+    grain: "DATE + STORE_CODE + PRODUCT_CODE (43,993,056 rows, 22 columns, confirmed live via inspect_schema)"
+    relevant_columns: ["DATE", "STORE_CODE", "PRODUCT_CODE", "VENDOR_CODE",
+      "STOCK_ONHAND_QTY", "ALLOC_QTY", "POS_ON_ORDER_QTY", "GIT_QTY"]
+    usage_in_this_playbook: >
+      Not queried during G1–G4. Warehouse-side counterpart to
+      store_invdetails — likely the source feed rolling up into
+      product_performance's warehouseStockOnhandQty, same relationship
+      store_invdetails is believed to have with stockOnhandQty. Relevant
+      to the quantity-calc playbook, not this one.
+
+  # ── calendar_plans is ONE shared dataset, created once (now confirmed) ──
+  calendar_plans:
+    alias: "calendar_plans"
+    domo_dataset_name: "Calendar Plans"
+    confirmed_id: "a21b4d4b-6edd-4a02-b2e3-d87ba71045ff"
+    status: >
+      CONFIRMED — created in Domo via create_domo_dataset and registered as
+      DOMO_CALENDAR_PLANS_DATASET_ID / MODULE_DATASETS["replenishment"].
+      Unlike store_mapping, this stays ONE single shared Domo dataset (all
+      plans, all rows, distinguished by planName + rowSeq) — never create a
+      second calendar_plans dataset. Every G4 write is write_to_domo_dataset
+      against this ID; create_domo_dataset is never called for it again.
+    grain: >
+      APPEND-ONLY dataset — write_to_domo_dataset adds a new row on every
+      G4 save (create_new, edit_existing, or clone_from_reference;
+      use_existing/G2B never writes here — see that gate), it does not
+      update in place. "The current state of a plan" = the LATEST row for
+      that planName (highest rowSeq — see notes). A planName can now have
+      MULTIPLE rows in practice, not just historically-possible-in-theory
+      — every edit_existing save adds one. Never assume one row per
+      planName when reading.
+    columns: ["planName", "warehouse", "productFamily", "runCadence",
+      "status", "storeMappingFileId", "clonedFrom",
+      "createdBy", "createdAt", "updatedAt", "rowSeq"]
+    notes: >
+      warehouse stores the StoreCode selected at G2A/G2D (a store_master
+      row where Format='Warehouse'), not a separate warehouse code
+      namespace. runCadence stored as a delimited string or JSON array of
+      full day names (Monday..Sunday) — confirm actual storage shape once
+      queried. status (draft | active | archived) is settable ONLY via
+      G2D (edit_existing) — create_new and clone_from_reference always
+      write status="active" and don't expose the field. storeMappingFileId
+      is that plan's own PHYSICAL Domo dataset ID (from create_domo_dataset
+      — see datasets.store_mapping): created once, on that plan's FIRST
+      save, and constant for the plan's lifetime thereafter —
+      edit_existing (G2D) does NOT change it, mapping is out of scope for
+      that gate (see G2D.out_of_scope). rowSeq is a monotonically
+      increasing integer the agent assigns at write time (max(rowSeq)+1
+      for that planName, or 1 if new) — this is what makes edit_existing
+      possible: an edit is just another APPEND with the SAME planName and
+      an incremented rowSeq, not an UPDATE. On an edit_existing write,
+      createdBy/createdAt MUST be copied forward from the plan's
+      previously-fetched latest row (never reset to "now"/the editing
+      user) — only updatedAt changes. clonedFrom also carries forward
+      unchanged on an edit.
+    read_pattern: >
+      To get a plan's current state: SELECT * FROM table WHERE planName =
+      '<name>' ORDER BY rowSeq DESC LIMIT 1. To check planName uniqueness
+      for a NEW plan (create_new/clone_from_reference only — edit_existing
+      intentionally reuses an existing planName, skip this check there):
+      SELECT DISTINCT planName FROM table (uniqueness is global across all
+      rows ever written, not just latest rows).
+  store_mapping:
+    alias: "store_mapping"
+    domo_dataset_name: "Replenishment Store mapping"
+    confirmed_id: "e2ff5910-cd44-4197-bc7e-0c0263167b8f"
+    status: >
+      CONFIRMED INPUT DATASET — STRICTLY READ-ONLY.
+      Contains the master store-level mapping for all 168 stores (StoreCode,
+      StoreName, LeadTime, Planning Horizon).
+      DO NOT CHANGE THIS DATA AT ANY STAGE. Consider it STRICTLY an input file.
+      Never call write_to_domo_dataset, create_domo_dataset, or update_method="REPLACE"
+      against this dataset.
+      Claude queries this dataset directly via MCP (query_dataset) as an authoritative
+      input. All Calendar Plans link to this storeMappingFileId by default without
+      asking the user for manual file uploads.
+    grain: >
+      One row per StoreCode. 168 rows, 168 distinct StoreCodes — no duplicate or
+      conflicting StoreCode rows, no nulls, no blank rows.
+    columns: ["StoreCode", "StoreName", "LeadTime", "Planning Horizon"]
+    notes: >
+      The master table header is exactly: StoreCode, StoreName, LeadTime,
+      Planning Horizon. StoreName and LeadTime are always present.
+      No planName or storeMappingFileId column here — all plans safely share this
+      authoritative store master mapping.
+      Planning Horizon ranges 5–12 and LeadTime 2–5, all positive integers.
+    read_pattern: >
+      To read store mapping rows: SELECT * FROM table against dataset ID
+      e2ff5910-cd44-4197-bc7e-0c0263167b8f.
+    required_columns: ["StoreCode", "Planning Horizon"]
+    optional_columns: ["StoreName", "LeadTime"]
+
+  # ── store_sku_min_display_mapping: SHARED dataset, STRICTLY READ-ONLY INPUT ──
+  store_sku_min_display_mapping:
+    alias: "store_sku_min_display_mapping"
+    domo_dataset_name: "Store_Sku_Min_Display_mapping"
+    confirmed_id: "7491b7c0-28e1-46fb-804f-79e69b714dc3"
+    status: >
+      CONFIRMED INPUT DATASET — STRICTLY READ-ONLY.
+      245,175 rows containing StoreCode, ProdReference, Size, MinDisplay, Sales Threshold %.
+      DO NOT CHANGE THIS DATA AT ANY STAGE. Consider it STRICTLY an input file.
+      Never call write_to_domo_dataset, create_domo_dataset, or update_method="REPLACE"
+      against this dataset.
+      Claude queries this dataset directly via MCP (query_dataset) for downstream
+      replenishment demand thresholds and minimum presentation units.
+    grain: >
+      One row per StoreCode + ProdReference + Size. 245,175 rows, 168 distinct StoreCodes,
+      292 distinct ProdReferences, 11 distinct Size values — zero duplicate rows at that grain.
+    relevant_columns: ["StoreCode", "ProdReference", "Size", "MinDisplay", "Sales Threshold %"]
+    confirmed_data_facts: >
+      Verified on the live dataset:
+        - "Sales Threshold %" is CONSTANT per ProdReference (0 references carry
+          more than one distinct value). Observed values: 20, 25, 30, 50.
+        - MinDisplay ranges 0–5.
+        - The 168 StoreCodes match the Store Mapping dataset's 168 stores.
+    read_pattern: >
+      Query via MCP: SELECT * FROM table against dataset ID 7491b7c0-28e1-46fb-804f-79e69b714dc3.
+      For volume reduction, group by ProdReference:
+      SELECT ProdReference, MAX(`Sales Threshold %`) AS SalesThresholdPct
+      FROM table GROUP BY ProdReference;
+    usage_in_this_playbook: >
+      Read directly via MCP query. Zero file uploads required from the user.
+      Strictly read-only at all stages.
+
+# ── Gates — run in order, ONE per turn, asked directly (no ask_user tool) ──
+# Each gate's entire final message is one structured JSON object (see
+# question_format); the user's next message is the raw answer, parsed
+# directly.
+gates:
+  - gate: G0
+    prompt_type: "none"
+    silent: true
+    user_facing: false
+    when: "always, first (internal execution only)"
+    action: >
+      Run schema_discovery internally in the background. NEVER ask the user
+      any questions, do not show interactive dialogs/menus, and do not emit
+      diagnostic messages at G0. Complete schema caching silently and
+      immediately present Gate G1 as the very first user-facing turn.
+
+  - gate: G1
+    prompt_type: "options"
+    when: "always"
+    message: "What do you want to do with Calendar Plans?"
+    options:
+      - {id: create_new, label: "Create a new Calendar Plan"}
+      - {id: use_existing, label: "Use an existing Calendar Plan"}
+      - {id: edit_existing, label: "Edit an existing Calendar Plan"}
+      - {id: clone_from_reference, label: "Create new, starting from an existing plan"}
+
+  - gate: G2A
+    prompt_type: "form"
+    when: "create_new"
+    message: "New Calendar Plan — basic details"
+    form:
+      fields:
+        - {name: planName, label: "Plan Name", input_type: text, required: true}
+        - name: warehouse
+          label: "Warehouse"
+          input_type: select
+          required: true
+          choices_from: >
+            SELECT DISTINCT StoreCode, StoreName FROM table WHERE Format =
+            'Warehouse' against store_master (confirmed_id
+            6469d8b2-ff81-4e20-9554-39245e744ff9). Display StoreName,
+            store StoreCode as the value.
+        - name: productFamily
+          label: "Product Family"
+          input_type: select
+          required: true
+          choices_from: >
+            SELECT DISTINCT Family FROM table WHERE Division <> 'NSM'
+            against product_master (confirmed_id
+            7fb59cab-dd64-4821-a55f-2276d808bfc3).
+        - name: runCadence
+          label: "Run Days"
+          input_type: multiselect
+          required: true
+          choices: ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    validation: "planName must be unique — query calendar_plans for an exact match before accepting; if found, reject and ask for a different name (do not silently overwrite). Also note: since store_mapping now creates a Domo dataset literally named <planName> (see G3), planName must additionally be a value create_domo_dataset can safely use as a Domo dataset name — reject empty/whitespace-only names."
+
+  - gate: G2B
+    prompt_type: "select"
+    when: "use_existing"
+    message: "Which Calendar Plan do you want to use?"
+    action: "SELECT DISTINCT planName FROM table ORDER BY planName against calendar_plans; present as dropdown. If calendar_plans doesn't exist yet or returns zero rows, tell the user there are no saved plans yet instead of showing an empty dropdown."
+    then: >
+      Fetch the selected plan's CURRENT state with:
+      SELECT * FROM table WHERE planName = '<selected>' ORDER BY rowSeq DESC LIMIT 1
+      against calendar_plans (see read_pattern in datasets.calendar_plans —
+      never assume the plan has only one row). Echo back its FULL
+      configuration READ-ONLY: planName, warehouse (StoreName + StoreCode),
+      productFamily, runCadence, status, storeMappingFileId, and the
+      mapped store count (SELECT COUNT(*) FROM table against that
+      storeMappingFileId). This is NOT an edit flow (that's G2D): do not
+      show an editable form, do not accept any field changes, and do not
+      prompt for a mapping-file upload — G3 never runs on this path.
+    confirm:
+      message: "Use this Calendar Plan as-is?"
+      options:
+        - {id: confirm, label: "Yes, use this plan"}
+        - {id: revise, label: "Pick a different plan"}
+    on_confirm: >
+      STOP here. Nothing is written to Domo on this path — no new
+      calendar_plans row, no rowSeq increment, no mapping dataset touched,
+      G3/G4 below do not run for use_existing. This playbook's scope ends
+      here for this path — the actual eligibility computation using this
+      confirmed plan is out of scope for this playbook (see top-level
+      description). Do NOT proactively offer/mention G5 (the min-display
+      mapping upload) here — it's opt-in, triggered only by the user's own
+      wording, not a follow-up prompt after confirming a plan.
+
+  - gate: G2D
+    prompt_type: "form"
+    when: "edit_existing"
+    message: >
+      Select the Calendar Plan to edit. planName cannot be changed here —
+      editing modifies the plan IN PLACE, it does not rename it; use
+      "Create new, starting from an existing plan" if you want a
+      differently-named copy instead.
+    select_step: >
+      Same selection pattern as G2B/G2C: SELECT DISTINCT planName FROM
+      table ORDER BY planName against calendar_plans; present as dropdown.
+      If there are no saved plans, tell the user plainly instead of
+      showing an empty dropdown.
+    then: >
+      Fetch the selected plan's CURRENT state with:
+      SELECT * FROM table WHERE planName = '<selected>' ORDER BY rowSeq
+      DESC LIMIT 1 against calendar_plans (never assume one row per
+      planName). Pre-populate the form below with that row's warehouse /
+      productFamily / runCadence / status — all editable. Hold onto that
+      row's createdBy, createdAt, storeMappingFileId, and clonedFrom too
+      (not shown as editable fields, but required at G4 — see
+      calendar_plans.notes).
+    form:
+      fields:
+        - {name: planName, label: "Plan Name", input_type: text, editable: false}
+        - name: warehouse
+          label: "Warehouse"
+          input_type: select
+          required: true
+          choices_from: >
+            SELECT DISTINCT StoreCode, StoreName FROM table WHERE Format =
+            'Warehouse' against store_master (confirmed_id
+            6469d8b2-ff81-4e20-9554-39245e744ff9). Same live source as
+            G2A, pre-selected to the plan's current value.
+        - name: productFamily
+          label: "Product Family"
+          input_type: select
+          required: true
+          choices_from: >
+            SELECT DISTINCT Family FROM table WHERE Division <> 'NSM'
+            against product_master (confirmed_id
+            7fb59cab-dd64-4821-a55f-2276d808bfc3). Same live source as
+            G2A, pre-selected to the plan's current value.
+        - name: runCadence
+          label: "Run Days"
+          input_type: multiselect
+          required: true
+          choices: ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+        - name: status
+          label: "Status"
+          input_type: select
+          required: true
+          choices: ["draft", "active", "archived"]
+          note: >
+            Not editable/settable anywhere else in this playbook —
+            create_new and clone_from_reference always write
+            status="active" and don't expose this field at all.
+            edit_existing (G2D) is the ONLY path that surfaces status to
+            the user.
+    out_of_scope: >
+      The mapping file (store_mapping) is NOT editable through this gate
+      — G3 never runs for edit_existing, and storeMappingFileId always
+      carries forward unchanged from the fetched row untouched. SCOPE
+      ASSUMPTION (inferred, not explicitly confirmed): based on the
+      instruction that introduced this gate giving runCadence/status as
+      its examples — both calendar_plans row-level fields — mapping-file
+      changes were treated as out of scope. If store-list changes should
+      also be editable here, that needs its own design (re-adding the
+      re-upload/versioning mechanism that was deliberately removed when
+      in-place edit didn't exist) and hasn't been built.
+    validation: "planName uniqueness is NOT re-checked here — it's intentionally reused, not new (skip G2A's uniqueness check entirely for this path)."
+
+  - gate: G2C
+    prompt_type: "select"
+    when: "clone_from_reference"
+    message: "Which existing Calendar Plan do you want to use as a starting point?"
+    action: "SELECT DISTINCT planName FROM table ORDER BY planName against calendar_plans; present as dropdown."
+    then: >
+      Fetch the reference plan's CURRENT state with:
+      SELECT * FROM table WHERE planName = '<selected>' ORDER BY rowSeq DESC LIMIT 1
+      against calendar_plans. Pre-populate the G2A form with that row's
+      warehouse / productFamily / runCadence — user may change any of
+      them — but planName is REQUIRED to be new and unique (same
+      uniqueness check as G2A, against ALL rows ever written, not just
+      latest per name). status is NOT pre-populated from the reference —
+      a clone is a brand-new plan, always starts status="active" same as
+      create_new (status is only user-settable via G2D). Store clonedFrom
+      = reference planName in the resulting record. At G3, ask explicitly
+      whether to reuse the reference plan's storeMappingFileId as-is
+      (points at the REFERENCE plan's own per-plan dataset — two
+      planNames legitimately sharing one physical mapping dataset is fine
+      to query, just be clear with the user that's what "reuse as-is"
+      means) or upload a fresh file (creates a BRAND NEW per-plan dataset,
+      named exactly this new planName, via create_domo_dataset at G4).
+
+  - gate: G3
+    prompt_type: "none"
+    silent: true
+    when: "after G2A / G2C fields are confirmed (never runs for use_existing/G2B or edit_existing/G2D)"
+    action: >
+      AUTOMATIC INPUT SOURCING — ZERO USER UPLOADS REQUIRED.
+      Do NOT ask the user to upload a file.
+      Query the authoritative Store Mapping dataset directly from Domo:
+      SELECT COUNT(*) AS store_count FROM table against dataset ID e2ff5910-cd44-4197-bc7e-0c0263167b8f.
+      This dataset contains all 168 stores with StoreCode, StoreName, LeadTime,
+      and Planning Horizon.
+      Assign storeMappingFileId = "e2ff5910-cd44-4197-bc7e-0c0263167b8f" for this plan.
+      STRICT READ-ONLY RULE: Never modify, overwrite, replace, or re-create this dataset at any stage.
+      Proceed silently to Gate G4.
+
+  - gate: G4
+    prompt_type: "options"
+    when: "after G2D fields are confirmed, OR after G3 auto-sourcing completes (never runs for use_existing/G2B)"
+    message: "Ready to save this Calendar Plan. Confirm?"
+    action: >
+      Echo back planName, warehouse (StoreName + StoreCode), productFamily,
+      runCadence, status, and mapped store count (168 stores from
+      e2ff5910-cd44-4197-bc7e-0c0263167b8f) in a clean markdown summary table.
+      Ask the user to confirm via an interactive pop-up question (confirm / revise).
+      On confirm:
+        Write ONE new row via write_to_domo_dataset against calendar_plans
+        (confirmed_id: a21b4d4b-6edd-4a02-b2e3-d87ba71045ff) with:
+          - planName: <planName>
+          - warehouse: <warehouse StoreCode>
+          - productFamily: <productFamily>
+          - runCadence: <runCadence>
+          - status: "active" (or G2D value for edit)
+          - storeMappingFileId: "e2ff5910-cd44-4197-bc7e-0c0263167b8f"
+          - clonedFrom: <reference planName or null>
+          - createdBy: <user email>
+          - createdAt: <timestamp or copied forward for edit>
+          - updatedAt: <current timestamp>
+          - rowSeq: max(rowSeq WHERE planName = '<name>') + 1 (or 1 if new)
+        Do NOT call create_domo_dataset — store mapping dataset e2ff5910-cd44-4197-bc7e-0c0263167b8f
+        is permanently shared as a read-only input.
+      On reject:
+        Return to G2A/G2D for corrections; do not write anything to Domo.
+    options:
+      - {id: confirm, label: "Save"}
+      - {id: revise, label: "Go back and change something"}
+
+  - gate: G5
+    prompt_type: "none"
+    silent: true
+    status: "READ_ONLY_INPUT"
+    description: >
+      Store & SKU level Minimum Display mapping dataset (7491b7c0-28e1-46fb-804f-79e69b714dc3).
+      STRICT READ-ONLY RULE: DO NOT CHANGE THIS DATA AT ANY STAGE.
+      Consider it STRICTLY an input file/dataset.
+      Never prompt the user to upload a file for it.
+      Never call write_to_domo_dataset, create_domo_dataset, or update_method="REPLACE" against this dataset.
+      If the user asks to inspect min-display or sales thresholds, query it read-only:
+      SELECT ProdReference, MAX(`Sales Threshold %`) AS SalesThresholdPct
+      FROM table GROUP BY ProdReference;
+
+# ── Question format ──
+question_format: >
+  Gate questions MUST be presented as natural, interactive conversational prompts
+  (formatted cleanly with markdown tables, bold headers, and numbered/bulleted choices),
+  NEVER as raw JSON objects or diagnostic dumps.
+  Gate G0 is 100% SILENT in the background (discovering schemas and checking token health).
+  Gate G1 presents the action menu directly with numbered choices:
+    1. (Recommended) Create a new plan
+    2. Use an existing plan (read-only)
+    3. Edit an existing plan
+    4. Clone from a reference plan
+  Gate G3 is AUTOMATIC (queries Domo dataset e2ff5910-cd44-4197-bc7e-0c0263167b8f silently).
+  Gate G4 presents the plan summary in a clean markdown table and asks for confirmation.
+  NEVER output raw JSON text like '{"gate": "G1", ...}' to the user.
+
+# ── Output schema — the config record + validation report ──
+output_schema:
+  calendar_plan:
+    planName: "string, globally unique for create_new/clone_from_reference; immutable for edit_existing."
+    warehouse: "string — StoreCode of a store_master row where Format='Warehouse'."
+    productFamily: "string — a Family value from product_master where Division<>'NSM'."
+    runCadence: "list[string], full day names (Monday..Sunday)."
+    status: "draft | active | archived."
+    storeMappingFileId: "string, UUID — permanently points to master store mapping dataset e2ff5910-cd44-4197-bc7e-0c0263167b8f."
+    rowSeq: "integer — monotonically increasing per planName."
+    clonedFrom: "string planName | null."
+    createdBy: "string email."
+    createdAt: "timestamp."
+    updatedAt: "timestamp."
+  validation_report:
+    stores_mapped: 168
+    store_mapping_id: "e2ff5910-cd44-4197-bc7e-0c0263167b8f"
+    status: "CONFIRMED_INPUT_VALID"
+
+guardrails:
+  - "STRICT READ-ONLY INPUT RULE: e2ff5910-cd44-4197-bc7e-0c0263167b8f (Replenishment Store mapping) and 7491b7c0-28e1-46fb-804f-79e69b714dc3 (Store_Sku_Min_Display_mapping) are PERMANENT READ-ONLY INPUT FILES. NEVER write, replace, update, or call create_domo_dataset on these datasets at any stage. Claude reads them directly via MCP (query_dataset) as authoritative inputs."
+  - "ZERO UPLOAD PROMPTS: Do NOT ask the user to upload mapping files. The system automatically reads both mapping datasets directly from Domo via MCP."
+  - "NO RAW JSON: Do NOT output raw JSON objects to the user for gate questions. Present all gate questions as clean, friendly interactive prompts with bulleted/numbered choices."
+  - "SILENT GATE G0: Gate G0 must run schema discovery completely silently in the background with zero user-facing diagnostic text or questions."
+  - "Module separation: this playbook only ever resolves dataset IDs from a Replenishment-scoped source. Never call an FA-scoped tool (e.g. get_fa_dataset_ids) or reuse an FA dataset ID."
+  - "edit_existing (G2D) IS a genuine in-place edit of an already-saved plan's warehouse/productFamily/runCadence/status — via an APPENDed calendar_plans row with the same planName and rowSeq+1, never an actual UPDATE."
+  - "calendar_plans is APPEND-ONLY (write_to_domo_dataset does not update in place). Every read that needs 'the current state' of a plan MUST resolve to the single latest row per planName (ORDER BY rowSeq DESC LIMIT 1)."
+  - "Warehouse and Product Family dropdowns are ALWAYS queried live from store_master/product_master at G2A/G2C/G2D — never hardcoded."
+  - "This playbook's scope is Calendar Plan configuration (G1-G4). Sourcing of min-display thresholds and store replenishment eligibility runs under Replenishment/Playbook/sales_probability_eligibility_v2.yml."

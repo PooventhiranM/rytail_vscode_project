@@ -1,0 +1,824 @@
+playbook_id: "REPL-SPE-01"
+playbook_name: "Sales Probability Store Eligibility — Replenishment"
+short_name: "sales_probability"
+
+description: >
+  EXTENDS eligibility.yml (REPL-ELIG-01) — specifically, this is the rule
+  for computation.step_5's currently-undefined case: what happens to a
+  store+product row where StockOnHandQty > 0 (the "non-zero-stock" TBD
+  flagged there). This playbook defines a Store-Sales-Probability (SSP)
+  score per Store+Product, used to decide store-level eligibility for
+  those rows, as opposed to eligibility.yml's warehouse-level zero-stock
+  check.
+
+  CONFIRMED (2026-08-27, with Pugal) SSP FORMULA SHAPE:
+    SSP(Store S, Product P) =
+        W1 × Recent Sell-Through   (7-day)
+      + W2 × Medium Sell-Through   (28-day)
+      + W3 × Store Demand Index    (store's historical share of the
+                                     product Family's demand vs network
+                                     average, compared NETWORK-WIDE across
+                                     ALL stores — not cluster/tier-scoped)
+      + W4 × Stock-Adjusted Factor (down-weights days the store had zero
+                                     stock, so it isn't penalized for
+                                     something it couldn't have sold)
+    → normalized to a 0-100% scale, compared against Sales Threshold %.
+
+  CONFIRMED WEIGHTS: W1=40, W2=30, W3=15, W4=15 (sum to 100).
+
+  CONFIRMED (2026-08-28, with Pugal) W1/W2 SELL-THROUGH FORMULA:
+    SellThrough_Nd% = ClampedQty_Nd / (ClampedQty_Nd + ClampedStockOnHandQty) × 100
+  where ClampedQty_Nd = MAX(Qty_Nd, 0) and ClampedStockOnHandQty =
+  MAX(StockOnHandQty, 0) — negative raw values (net returns exceeding
+  sales in a window; a genuine data anomaly in store_invdetails) are
+  clamped to 0 BEFORE the formula runs, per Pugal's explicit decision
+  (live-tested: 5 of 692 rows hit this in the test scope). 0/0 (both
+  clamped inputs zero) = 0% (also confirmed). See
+  intermediate_views.view_4_store_reference_sell_through — this feeds W1
+  directly from SellThrough_7d_pct and W2 from SellThrough_28d_pct.
+
+  CONFIRMED, LIVE-TESTED (2026-08-28, with Pugal) W4 STOCK-ADJUSTED
+  FACTOR FORMULA:
+    StockAdjustedFactor% = (28 - DaysWithoutStock_28d) / 28 × 100
+  i.e. the % of the last 28 days the store actually had stock to sell.
+  Folded directly onto view_4 as StockAdjustedFactor_pct — reuses
+  view_3/view_4's already-live-tested DaysWithoutStock_28d column, no new
+  query/view needed. Uses the 28-day window only (not a 7d/28d blend) —
+  W4 is a stability/availability signal, W1 already covers 7-day recency.
+
+  CONFIRMED, LIVE-TESTED (2026-08-28, with Pugal) W3 STORE DEMAND INDEX:
+    StoreShare(S) = Store S's total Family sales qty (28d) / Network's
+                    total Family sales qty (28d)
+    FairShare = 1 / (count of stores that sold this Family at all, 28d)
+    DemandIndex(S) = StoreShare(S) / FairShare
+    StoreDemandIndex% = PERCENTILE RANK of DemandIndex(S) among all
+                        stores that sold this Family, scaled 0-100
+  28-day window (reusing the existing window, not a longer/separate
+  lookback). Percentile rank chosen over a capped-linear scale (e.g.
+  min(index,2)/2×100) specifically to avoid an arbitrary cap — see
+  decisions.w3_normalization. Built as
+  intermediate_views.view_5_store_family_demand_index — live-tested: 168
+  stores sold the family in the test scope, network total cross-validated
+  two independent ways (7,339 both times), percentile range confirmed to
+  span exactly [0,100].
+
+  STILL TBD (do not invent): view_5 (W3) has NOT yet been joined into
+  view_4's Store+Reference output — see
+  view_5_store_family_demand_index.open_note for the join-key
+  consideration (W3 is Family-grain, not Reference-grain). The exact
+  final SSP normalization once all four weighted components are summed
+  (W1/W2/W3/W4 individually land on 0-100% now, but the WEIGHTED SUM
+  W1×ST7+W2×ST28+W3×DemandIdx+W4×StockAdj has not been computed/
+  live-tested end-to-end with real numbers), and how the final SSP is
+  compared against Sales Threshold % (>=, >, etc.) to yield an
+  eligible/not-eligible decision, are both still open. Only the pieces
+  explicitly marked CONFIRMED above, and the intermediate_views marked
+  CONFIRMED/live-tested, are safe to build on — everything else is still
+  open.
+
+  MODULE NOTE: same Replenishment MCP tool surface as Calendar/skill.md
+  and eligibility.yml (get_replenishment_dataset_ids, query_dataset,
+  inspect_schema) — no new tool needed. Same scope-isolation guardrail as
+  eligibility.yml applies: every query here is scoped to ONE Calendar
+  Plan's warehouse+productFamily, never blended across plans.
+
+# ── Confirmed decisions (2026-08-27, with Pugal) ──
+decisions:
+  sell_through_source: >
+    CONFIRMED: W1/W2 sell-through is built FROM RAW DATA (online_sales +
+    offline_sales + store_invdetails), NOT from the pre-computed
+    sellThru%/ros% columns already present in the `performance` dataset
+    (DEV|OUT|Rytail Product Performance). That dataset's columns were
+    considered and explicitly rejected as the source for this playbook —
+    their exact upstream calc (whether already stock-adjusted, what
+    window they use) is unconfirmed, so building from scratch here keeps
+    this playbook's math fully auditable. `performance` may still be used
+    for other things later, just not W1/W2.
+  demand_index_scope: >
+    CONFIRMED: Store Demand Index (W3) compares a store's share of a
+    product Family's demand against the NETWORK-WIDE average across ALL
+    stores — not scoped to cluster/storeGroup/tier peers, even though
+    `performance` has those columns available. Exact formula still TBD
+    (see description).
+  sales_threshold_source: >
+    CONFIRMED: Sales Threshold % (the value SSP is ultimately compared
+    against) comes from store_sku_min_display_mapping
+    (2ee08d66-2eec-43af-a711-a7505a325629), aggregated to ProdReference
+    grain — see intermediate_views.view_1_prodref_sales_threshold. This
+    step ONLY aggregates the threshold value; it does NOT compare it
+    against any store yet (that comparison happens later, once SSP itself
+    is fully defined).
+  view_1_sales_source: >
+    CONFIRMED (2026-08-27): the sales+product join view
+    (intermediate_views.view_2_store_reference_sales_qty) uses
+    offline_sales (DEV|OUT|Saleline Store) ONLY for now. online_sales
+    (DEV|OUT|Saleline Ecom) is deliberately deferred — a parallel/unioned
+    online view was explicitly discussed and NOT built yet. Do not assume
+    online_sales is already included anywhere in this playbook's
+    computed quantities until a matching online view is built and this
+    note is updated.
+  anchor_date: >
+    CONFIRMED: "last 7 days" / "last 28 days" windows anchor on
+    MAX(SALE_TRANS_DATE) actually present in the sales table being
+    queried, NOT system current date — same pattern as
+    eligibility.yml's step_2_warehouse_stock_snapshot (MAX(DATE)), and
+    for the same reason: live-tested 2026-08-27 and found offline_sales'
+    MAX(SALE_TRANS_DATE) was 2026-08-04, ~23 days behind system today
+    (2026-08-27) — anchoring on system today would silently return a
+    near-empty 7-day window. CORRECTION (2026-08-27, caught while
+    building view_3's DaysWithoutStock columns): "last N days" means N
+    CALENDAR DAYS INCLUSIVE of the anchor date — i.e. `DATE >=
+    DATE_ADD(anchor, -(N-1)) AND DATE <= anchor`. view_2's step (b) SQL
+    as originally written used `DATE_ADD(anchor, -7)` /
+    `DATE_ADD(anchor, -28)`, which actually spans 8 and 29 days
+    respectively (off-by-one). This was invisible in view_2 (no hard
+    denominator to contradict it) but became a visible bug in view_3's
+    DaysWithoutStock_28d, which went NEGATIVE for 633 of 738 pairs before
+    the fix (28 - 29 possible non-zero days = -1). view_2's step (b) SQL
+    STILL HAS THIS BUG as written below — it has not yet been re-run with
+    the -(N-1) correction; treat its "confirmed" Qty_7d/Qty_28d SQL as
+    needing this same fix before being trusted, not as already correct.
+  raw_json_pagination_cap: >
+    DISCOVERED (2026-08-27, while building view_3): query_dataset's
+    raw_json=True mode silently truncates results — no error is raised,
+    only a `truncated: true` flag buried in the response, alongside
+    `row_count`/`returned_count` fields that DO reflect the true total.
+    Caught by comparing against a separate COUNT(*) query (true count was
+    4,023 vs 2,212 returned on a 3-column query). REVISED UNDERSTANDING
+    (caught on a second, harder bug while building DaysWithoutStock): the
+    cap is NOT a fixed row count — it's response-PAYLOAD-SIZE-based. A
+    wider 4-column query (adding DATE) truncated each `LIMIT 2000` page
+    down to only ~1,425-1,459 rows, not ~2,212. A pagination loop that
+    stops as soon as a page returns fewer rows than requested (`got <
+    page_size`) is UNSAFE and WILL silently drop data — it did, on the
+    first DaysWithoutStock attempt (fetched only 1,425 of 115,838 true
+    rows and never noticed, because 1,425 < LIMIT 2000 looked like a
+    legitimate last page). CORRECT FIX: always check the response's own
+    `truncated` flag per page — advance OFFSET by the actual rows
+    returned, and only treat a page as the final one when `truncated` is
+    false AND it returned fewer rows than requested. Do not infer
+    completion from row count alone. Cross-validate the final total
+    against a separate COUNT(*) query when the stakes are non-trivial —
+    this is what caught both the original 2,212 truncation and the
+    silent 1,425-row failure.
+  store_stock_staleness: >
+    OPEN, NOT YET RESOLVED WITH PUGAL: store_invdetails' latest snapshot
+    DATE (live-tested 2026-08-27) is 2026-02-06 — about 6.5 months stale.
+    See intermediate_views.view_3_store_reference_stock_onhand.open_flag
+    for detail. This affects any use of "current in-hand stock" at the
+    store level in this playbook (W4 Stock-Adjusted Factor, and possibly
+    store-level eligibility itself) — flagged, not silently accepted or
+    worked around.
+  view2_view3_join_type: >
+    CONFIRMED (2026-08-28, with Pugal): view_4 (see
+    intermediate_views.view_4_store_reference_sell_through) INNER JOINs
+    view_2 and view_3-combined on (StoreCode, Reference) — pairs present
+    in only one side are DROPPED, not kept with nulls/zeros. Live-tested:
+    view_2 had 1,244 Store+Reference pairs, view_3-combined had 738; the
+    INNER JOIN kept 692. This means ~552 view_2 pairs (sales with no
+    matching current-stock data) and ~46 view_3 pairs (stock with no
+    matching sales in the window) are silently excluded from view_4's
+    output — a real, confirmed data-loss tradeoff of the INNER JOIN
+    choice, not a bug.
+  negative_value_clamping: >
+    CONFIRMED (2026-08-28, with Pugal): before computing SellThrough_Nd%
+    in view_4, MAX(Qty_Nd, 0) and MAX(StockOnHandQty, 0) are applied —
+    negative raw values are clamped to 0, not excluded or left as-is.
+    DISCOVERED LIVE (2026-08-28): 5 of 692 Store+Reference pairs in the
+    BOYS CORE DENIM test scope had a negative Qty_7d/Qty_28d (net returns
+    exceeding sales in that window) and/or a negative StockOnHandQty (a
+    genuine store_invdetails data anomaly, not a query bug — confirmed by
+    re-checking the raw SUM) — left unclamped, these produced
+    SellThrough% values outside the valid 0-100% range (as low as
+    -14.29%, as high as 125%). Clamping is a deliberate choice that masks
+    the underlying anomaly for THIS view's purposes — the raw negative
+    values are still visible in view_2/view_3's own outputs (Qty_Nd,
+    StockOnHandQty), only view_4's SellThrough% is clamped.
+  w4_formula: >
+    CONFIRMED (2026-08-28, with Pugal): StockAdjustedFactor% = (28 -
+    DaysWithoutStock_28d) / 28 × 100 — reuses view_3/view_4's
+    already-live-tested DaysWithoutStock_28d directly, no new view
+    needed. 28-day window only (W1 already covers 7-day recency; W4 is
+    meant as a stability/availability signal, not another recency one).
+    LIVE-TESTED as its own column in view_4 and in the final SSP
+    computation 2026-08-28 (see computation section below).
+  w3_normalization: >
+    CONFIRMED (2026-08-28, with Pugal): Store Demand Index normalizes
+    onto 0-100% via PERCENTILE RANK of each store's DemandIndex among all
+    stores that sold the Family (not a capped-linear scale like
+    min(index,2)/2×100) — chosen specifically to avoid picking an
+    arbitrary cap value, and because it's self-scaling/naturally bounded.
+    DemandIndex(S) = StoreShare(S) / FairShare, where StoreShare(S) =
+    store S's total Family sales qty ÷ network's total Family sales qty,
+    and FairShare = 1 / (count of stores that sold the Family at all).
+  w3_window: >
+    CONFIRMED (2026-08-28, with Pugal): Store Demand Index reuses the
+    existing 28-day window (same as W2/view_3), NOT a separate/longer
+    lookback — deliberately chosen for consistency across the playbook
+    over introducing a new window to validate.
+  w3_new_view_needed: >
+    W3 required a NEW intermediate view — sales aggregated to Store+
+    Family grain (dropping the Reference dimension that view_2 uses) plus
+    a network-wide Family total, needed to compute StoreShare/FairShare/
+    DemandIndex above. BUILT AND LIVE-TESTED 2026-08-28 as
+    intermediate_views.view_5_store_family_demand_index.
+  threshold_coverage_gap: >
+    DISCOVERED LIVE (2026-08-28): store_sku_min_display_mapping only
+    covers a SMALL SUBSET of the catalog — for the BOYS CORE DENIM test
+    family, only 7 of 47 product_master References (49 of 191 Item
+    Codes) had a matching ProdReference with a Sales Threshold % defined.
+    The mapping table has only 292 distinct ProdReference values total,
+    ACROSS ALL FAMILIES — not full catalog coverage. CONFIRMED (with
+    Pugal): the final SSP/eligibility computation ONLY outputs rows for
+    References that HAVE a defined threshold — References with no
+    threshold are excluded entirely (not included with a null
+    eligibility flag, not defaulted to some threshold). This means most
+    of a Family's References may never appear in eligibility output at
+    all if they're outside store_sku_min_display_mapping's current
+    coverage — this is a real scope limitation of the current data, not
+    a bug in this playbook's logic. Whether store_sku_min_display_mapping
+    is meant to eventually cover the full catalog is UNRESOLVED — flagged
+    here, not assumed either way.
+  view4_view5_join_type: >
+    CONFIRMED (2026-08-28, with Pugal): the final computation LEFT JOINs
+    view_4 (Reference-grain) with view_5 (Family-grain, keyed by
+    StoreCode only) — every view_4 row is kept; a store with no view_5
+    entry (zero family sales in the 28d window) gets
+    StoreDemandIndex_pct=0 (lowest possible, not dropped, not null).
+    Different from the view_2⋈view_3 join (which is INNER) — deliberately
+    so, since W3's absence is meaningfully different from W1/W2/W4's
+    absence (no stock/sales data at all vs. simply zero relative demand
+    share).
+  ssp_threshold_comparison: >
+    CONFIRMED (2026-08-28, with Pugal): Eligible = (SSP >= SalesThresholdPct)
+    — inclusive; a store exactly AT the threshold counts as eligible.
+    Live-tested: BOYS CORE DENIM test scope, 244 of 276 rows eligible.
+  ssp_eligible_stores_persistence: >
+    CONFIRMED (2026-08-28, with Pugal): computation.output (StoreCode,
+    Reference, Qty_7d, Qty_28d, StockOnHandQty, SellThrough_7d_pct,
+    SellThrough_28d_pct, StoreDemandIndex_pct, StockAdjustedFactor_pct,
+    SSP, SalesThresholdPct, Eligible) is written to a dedicated Domo
+    dataset, "SSP_eligibility_Final", PLUS three run-identity columns:
+    CalendarPlanName, RunId, computedAt (15 columns total). CURRENT LIVE
+    dataset: confirmed_id a1bf0a87-d46a-48a3-a4c0-7fc47d3137c5, 276 rows,
+    RunId=1, CalendarPlanName="Calendar plan A" — see
+    schema_fix_history_2026_08_28 below for how it got here (this is the
+    THIRD dataset in this saga, not the first). FROM THE SECOND RUN
+    ONWARD: write_to_domo_dataset with update_method="APPEND" (never
+    REPLACE, never create_domo_dataset again) — same convention as
+    calendar_plans. RunId is a SEQUENTIAL NUMBER PER CALENDAR PLAN (like
+    calendar_plans' rowSeq), NOT global and NOT timestamp-based — before
+    each future write, read this dataset's MAX(RunId) WHERE
+    CalendarPlanName='<the plan>' and use MAX+1 (or 1 if that plan has no
+    prior rows). computedAt is a timestamp (ISO 8601, UTC) stamped fresh
+    on every run, stored as STRING (create_domo_dataset's type inference
+    does not recognize this timestamp format as DATE — flagged, not a
+    bug). Eligible is stored as STRING ("True"/"False" text), NOT a
+    native Domo boolean — the tool's column-type inference only supports
+    STRING/LONG/DOUBLE/DATE; any downstream consumer must compare against
+    the string, not a boolean type. Registered in mcp_sever 1.py's
+    MODULE_DATASETS["replenishment"] as alias "ssp_eligible_stores" (env
+    var DOMO_SSP_ELIGIBLE_STORES_DATASET_ID) — confirmed live via
+    get_replenishment_dataset_ids() after each server restart.
+  schema_fix_history_2026_08_28: >
+    NOT INVENTED, ACTUALLY HAPPENED — kept here as a record of what went
+    wrong and why, since it explains why the live dataset ID changed
+    twice in one day and two new MCP tools now exist:
+    (1) "SSP Eligible Stores" (12 columns, id 4e508e9f-...) created
+    first, WITHOUT Qty_7d/Qty_28d/StockOnHandQty (an oversight — those
+    values were already computed in view_4 but dropped before writing).
+    (2) Per Pugal, tried to add those 3 columns. write_to_domo_dataset's
+    REPLACE with a different column count failed: HTTP 400 — Domo's Data
+    API import only accepts data matching a dataset's ALREADY-DEFINED
+    schema, it cannot add columns via a data upload.
+    (3) No schema-alter or delete tool existed in mcp_sever 1.py at that
+    point — only create (always a NEW dataset+id) and write (fixed
+    schema). Per Pugal's instruction, TWO NEW TOOLS were added:
+    update_domo_dataset_schema (PUT .../v1/datasets/{id}, role deployer,
+    dry-run by default — changes an existing dataset's column schema,
+    but does NOT migrate existing data, a REPLACE with matching data must
+    follow) and delete_domo_dataset (DELETE .../v1/datasets/{id}, role
+    admin — the highest tier in TOOL_ROLES, irreversible). Both are
+    dry-run-by-default/confirm=True-gated, same pattern as
+    create_domo_dataset.
+    (4) DISCOVERED while testing update_domo_dataset_schema: a
+    newly-created OAuth dataset is NOT immediately readable via the
+    internal read API (inspect_schema/_domo_get_dataset) — got HTTP 403
+    on "SSP Eligible Stores" moments after creation, while "Calendar
+    Plans" (created earlier, same mechanism) read fine. Confirmed as a
+    PROPAGATION DELAY, not a permanent permissions gap — retried ~90
+    seconds later and it read successfully. Worth remembering for any
+    future create_domo_dataset call immediately followed by a read: give
+    it a short wait before assuming failure.
+    (5) Per Pugal's final instruction, did NOT end up using
+    update_domo_dataset_schema for this fix — instead created a THIRD,
+    genuinely new dataset "SSP_eligibility_Final" (id
+    a1bf0a87-d46a-48a3-a4c0-7fc47d3137c5, 15 columns, correct from the
+    start) via create_domo_dataset, and repointed the registry
+    (.env/mcp_sever 1.py's ssp_eligible_stores alias) at it.
+    RESULT: "SSP Eligible Stores" (4e508e9f-..., 12 columns) is now
+    ORPHANED — no longer referenced anywhere, not deleted (delete_domo_dataset
+    exists now but was never invoked on it — left for Pugal to decide,
+    not deleted unilaterally). update_domo_dataset_schema and
+    delete_domo_dataset remain available in mcp_sever 1.py for future use
+    even though this specific fix didn't end up using the schema-alter
+    path.
+
+# ── Intermediate views (built incrementally, each live-tested before use) ──
+intermediate_views:
+  view_1_prodref_sales_threshold:
+    status: "CONFIRMED, live-tested 2026-08-27"
+    purpose: >
+      Aggregate Sales Threshold % to ProdReference grain from
+      store_sku_min_display_mapping. Per Pugal: aggregate ONLY, do not
+      compare against any store at this step.
+    dataset: "store_sku_min_display_mapping (2ee08d66-2eec-43af-a711-a7505a325629)"
+    sql: >
+      SELECT ProdReference, MAX(`Sales Threshold %`) AS SalesThresholdPct
+      FROM table GROUP BY ProdReference
+    verified_facts: >
+      Live-tested: `Sales Threshold %` is CONSTANT per ProdReference — a
+      query for ProdReferences with >1 distinct Sales Threshold % value
+      returned 0 rows. So MIN/MAX/AVG are all equivalent here; MAX used
+      arbitrarily. 292 distinct ProdReference values total in the table
+      (245,175 total rows at Store+ProdReference+Size grain).
+
+  view_2_store_reference_sales_qty:
+    status: "CONFIRMED, live-tested end-to-end 2026-08-28 (BOYS CORE DENIM / offline_sales, corrected -6/-27 offsets)"
+    purpose: >
+      Per Pugal's instruction: join offline_sales (DEV|OUT|Saleline
+      Store) to product_master to bring Family/Item Code/Reference onto
+      sales rows, then aggregate to Store+Reference+Family grain: last
+      7-day and last 28-day Sale Qty (by SALE_TRANS_DATE), filtered to
+      the Calendar Plan's productFamily (scope_isolation_guardrail,
+      inherited from eligibility.yml's scheduling section).
+    implementation_note: >
+      IMPORTANT — query_dataset operates on ONE Domo dataset per call;
+      there is no cross-dataset SQL JOIN available. This view is built as
+      a CLIENT-SIDE merge of two separate queries, same pattern as
+      eligibility.yml's step_3/step_4 (resolve product_master's scope
+      first, then filter/aggregate the sales dataset against it) — not a
+      single SQL statement:
+        (a) product_master: SELECT DISTINCT `Item Code`, `Reference`
+            FROM table WHERE `Family` = '<plan.productFamily>' AND
+            `Reference` <> '' — gives the Item Code → Reference map for
+            this plan's family (191 Item Codes for BOYS CORE DENIM,
+            live-tested).
+        (b) offline_sales: SELECT STORE_CODE, PRODUCT_CODE,
+            SUM(CASE WHEN SALE_TRANS_DATE >= DATE_ADD('<max_date>', -6)
+              THEN SALE_TOT_QTY ELSE 0 END) AS Qty_7d,
+            SUM(CASE WHEN SALE_TRANS_DATE >= DATE_ADD('<max_date>', -27)
+              THEN SALE_TOT_QTY ELSE 0 END) AS Qty_28d
+            FROM table
+            WHERE PRODUCT_CODE IN (<Item Codes from step a>)
+              AND SALE_TRANS_DATE >= DATE_ADD('<max_date>', -27)
+            GROUP BY STORE_CODE, PRODUCT_CODE
+            — where <max_date> = MAX(SALE_TRANS_DATE) from offline_sales
+            itself (see decisions.anchor_date). CORRECTED offsets (-6/-27,
+            not the originally live-tested -7/-28) per
+            decisions.anchor_date's off-by-one fix — "last N days" =
+            N calendar days INCLUSIVE of max_date. Re-run end-to-end with
+            these corrected offsets 2026-08-28 (see verified_facts below).
+        (c) Merge (b)'s rows onto (a)'s Item Code → Reference map
+            client-side, then re-aggregate (sum) Qty_7d/Qty_28d from
+            Item-Code grain up to Reference grain (since one Reference
+            spans multiple Item Codes, one per Size) to get the final
+            Store + Reference + Family + Qty_7d + Qty_28d rows.
+    verified_facts: >
+      SUPERSEDED 2026-08-28 — now fully live-tested end-to-end with the
+      CORRECTED -6/-27 offsets (as part of building view_4, which needed
+      real view_2 output to join against): step (a) 191 Item Codes. Step
+      (b) with corrected offsets: true COUNT(*) = 7,768 rows (this
+      differs from the earlier UNCORRECTED -7/-28 test's 4,752-row figure
+      — the two are not comparable, different window widths) — paginated
+      fetch (truncated-flag-checking pattern, see
+      decisions.raw_json_pagination_cap) returned 4,631 Store+ProductCode
+      rows with SQL-side GROUP BY already applied. Step (c): merged onto
+      the Item Code → Reference map and re-aggregated, producing 1,244
+      distinct Store+Reference pairs. This is now a fully verified
+      end-to-end result, not just steps (a)/(b) in isolation — see
+      intermediate_views.view_4_store_reference_sell_through for the full
+      pipeline and its own verified_facts.
+
+  view_3_store_reference_stock_onhand:
+    status: "CONFIRMED, live-tested end-to-end 2026-08-27 (BOYS CORE DENIM / store_invdetails)"
+    purpose: >
+      Per Pugal's instruction: join store_invdetails (SU_Store_Inventory)
+      to product_master to bring the in-hand stock for each product
+      Reference. Output: aggregated StoreCode + Reference + SUM of
+      STOCK_ONHAND_QTY (latest snapshot), PLUS DaysWithoutStock_7d and
+      DaysWithoutStock_28d (added per Pugal's follow-up instruction) —
+      how many of the last 7 / last 28 calendar days that Store+Reference
+      had ZERO combined stock across all its sizes, filtered to the
+      Calendar Plan's productFamily. A day counts as "no stock" only when
+      the SUM across every Item Code/size under that Reference is 0 for
+      that store that day (CONFIRMED with Pugal — combined, not
+      per-size).
+    implementation_note: >
+      Same client-side merge pattern as view_2 (no cross-dataset SQL
+      JOIN available). TWO separate sub-queries against store_invdetails,
+      different DATE scope each:
+        (a) product_master: SELECT DISTINCT `Item Code`, `Reference`
+            FROM table WHERE `Family` = '<plan.productFamily>' AND
+            `Reference` <> '' — same Item Code → Reference map as view_2.
+        (b1) SUM_ONHAND sub-query (latest snapshot only): SELECT
+            STORE_CODE, PRODUCT_CODE, STOCK_ONHAND_QTY FROM table WHERE
+            PRODUCT_CODE IN (<Item Codes from step a>) AND DATE = (SELECT
+            MAX(DATE) FROM table) — LATEST SNAPSHOT ONLY, same reasoning
+            as eligibility.yml's step_2_warehouse_stock_snapshot:
+            STOCK_ONHAND_QTY is a point-in-time balance, not a flow, so
+            summing across DATE would be meaningless — only the single
+            latest-DATE snapshot is used here.
+        (b2) DAYS_WITHOUT_STOCK sub-query (full 28-day daily history —
+            DIFFERENT from b1): SELECT STORE_CODE, PRODUCT_CODE, DATE,
+            STOCK_ONHAND_QTY FROM table WHERE PRODUCT_CODE IN (<Item
+            Codes from step a>) AND DATE >= DATE_ADD((SELECT MAX(DATE)
+            FROM table), -27) AND DATE <= (SELECT MAX(DATE) FROM table)
+            — the -27 offset (not -28) is the corrected inclusive-28-day
+            window, see decisions.anchor_date's off-by-one fix.
+            ANCHOR CONFIRMED (with Pugal) to be store_invdetails' OWN
+            MAX(DATE), NOT offline_sales'/system-today's — the two
+            datasets' max dates are ~6 months apart (see
+            decisions.store_stock_staleness); this view's "last 7/28
+            days" describes a materially different calendar period than
+            view_2's "last 7/28 days" as a result. Both b1 and b2 MUST BE
+            PAGINATED (see decisions.raw_json_pagination_cap — check
+            `truncated` per page, do not infer completion from row count
+            alone; this specific query silently returned only 1,425 of
+            115,838 true rows on the first attempt before the pagination
+            bug was caught and fixed).
+        (c) Merge b1's rows onto (a)'s Item Code → Reference map
+            client-side, SUM STOCK_ONHAND_QTY per Store+Reference — this
+            is StockOnHandQty. Separately, merge b2's rows onto the same
+            map, group by (Store, Reference, DATE) summing
+            STOCK_ONHAND_QTY across sizes for that day, then per
+            Store+Reference count DISTINCT dates with combined qty > 0
+            within the last 7 / 28 days; DaysWithoutStock_7d = 7 - (days
+            with stock in last 7), DaysWithoutStock_28d = 28 - (days with
+            stock in last 28). NOTE: b1 and b2 can yield DIFFERENT sets
+            of Store+Reference pairs (b1 is latest-day-only = narrower;
+            b2 spans 28 days so can surface pairs with no CURRENT stock
+            but some stock earlier in the window, or vice versa) — the
+            final view_3 output needs an OUTER JOIN of b1's and b2's
+            results on (Store, Reference), not an assumption that both
+            cover the same key set.
+    verified_facts: >
+      Live-tested end-to-end against Calendar plan A's scope
+      (family=BOYS CORE DENIM): step (a) 191 Item Codes. b1: no duplicate
+      rows found at (DATE, STORE_CODE, PRODUCT_CODE) grain (confirmed via
+      a live COUNT(*)>1 check — 0 rows), true row count via COUNT(*) =
+      4,023 — pagination fetched all 4,023 rows correctly across 3 pages
+      (each fully at page_size, no truncation hit, so this was safe even
+      before the pagination bug was found). Aggregated (c) to 699
+      distinct Store+Reference rows, total StockOnHandQty = 8,220. b2
+      (corrected -27 offset): true COUNT(*) = 111,494 rows across exactly
+      28 distinct dates (2026-01-10 .. 2026-02-06, confirmed) — fetched
+      completely via truncation-aware pagination (verified against the
+      COUNT(*)). Aggregated (c) to 738 distinct Store+Reference rows (a
+      DIFFERENT, larger set than b1's 699 — confirms the outer-join note
+      above is real, not theoretical), zero negative
+      DaysWithoutStock_7d/28d values (sanity check: a negative value
+      would mean more "days with stock" were counted than exist in the
+      window — this occurred and was caught before the -27 fix, when the
+      unfixed -28 offset produced 633/738 pairs with a negative
+      DaysWithoutStock_28d).
+    open_flag: >
+      NOT YET RESOLVED WITH PUGAL: store_invdetails' latest snapshot DATE
+      is 2026-02-06 — live-tested 2026-08-27, so this is ~6.5 months
+      stale, and also older than offline_sales' latest date (2026-08-04,
+      itself ~23 days stale — see decisions.anchor_date). Using a
+      6-month-old snapshot as "current in-hand stock" may not be
+      appropriate depending on how this feeds W4 (Stock-Adjusted Factor)
+      or any store-level eligibility decision — flagged here rather than
+      silently proceeding. No fresher per-store stock dataset is known to
+      exist in MODULE_DATASETS today.
+
+  view_4_store_reference_sell_through:
+    status: "CONFIRMED, live-tested end-to-end 2026-08-28 (BOYS CORE DENIM)"
+    purpose: >
+      Per Pugal's instruction: INNER JOIN view_2 (sales) and view_3
+      (stock) on (StoreCode, Reference), then compute 7-day and 28-day
+      Sell-Through% — THIS IS W1/W2's sell-through formula, now
+      CONFIRMED (see top-level description). Output schema: StoreCode,
+      Reference, Last 7 Days Sale Qty, Last 28 Days Sale Qty,
+      StockOnHandQty, DaysWithoutStock_7d, DaysWithoutStock_28d,
+      SellThrough_7d_pct, SellThrough_28d_pct, StockAdjustedFactor_pct
+      (added 2026-08-28 — THIS IS W4, folded onto this view rather than a
+      separate one since it's a trivial derived column from data already
+      here, no new query needed). No Family column (matches view_3's
+      precedent — family is filter-only, not carried in output).
+    formula: >
+      SellThrough_7d_pct = MAX(Qty_7d,0) / (MAX(Qty_7d,0) +
+      MAX(StockOnHandQty,0)) × 100
+      SellThrough_28d_pct = MAX(Qty_28d,0) / (MAX(Qty_28d,0) +
+      MAX(StockOnHandQty,0)) × 100
+      Both negative-clamped-to-0 before dividing (see
+      decisions.negative_value_clamping); 0/0 → 0% (both confirmed with
+      Pugal). NOTE: the SAME StockOnHandQty (view_3's latest-snapshot
+      value) is used as the denominator component for BOTH the 7d and
+      28d calc — it is not itself a 7-day or 28-day figure, it's a
+      point-in-time balance shared by both formulas.
+      StockAdjustedFactor_pct (W4) = (28 - DaysWithoutStock_28d) / 28 ×
+      100 — see decisions.w4_formula. Pure derived column, no clamping or
+      join logic needed (DaysWithoutStock_28d is already 0-28, verified
+      non-negative in view_3).
+    implementation_note: >
+      Join is INNER on (StoreCode, Reference) — see
+      decisions.view2_view3_join_type for the confirmed row-count
+      tradeoff. Mechanically this is a THIRD client-side merge on top of
+      view_2's and view_3's own internal client-side merges (no
+      cross-dataset SQL JOIN anywhere in this playbook — see guardrails).
+      view_3's own b1 (StockOnHandQty) and b2 (DaysWithoutStock) are
+      first combined via OUTER JOIN internally (as documented under
+      view_3), and THAT combined result is what INNER JOINs against
+      view_2's Qty_7d/Qty_28d output here.
+    verified_facts: >
+      Live-tested end-to-end 2026-08-28 against Calendar plan A's scope
+      (family=BOYS CORE DENIM), USING THE CORRECTED -6/-27 offsets for
+      view_2 for the first time (superseding view_2's earlier
+      not-yet-reverified entry): view_2's raw COUNT(*) = 7,768 rows
+      (corrected window) → paginated fetch of 4,631 Store+ProductCode
+      rows (SQL-side GROUP BY) → aggregated to 1,244 Store+Reference
+      pairs. view_3-combined (per its own entry) = 738 pairs. INNER JOIN
+      = 692 pairs (1,244 ∩ 738). Sanity checks: 5/692 rows required
+      negative-value clamping (see decisions.negative_value_clamping);
+      after clamping, ALL 692 rows' SellThrough_7d_pct and
+      SellThrough_28d_pct fall within [0,100] (re-verified by hand for
+      the 5 previously out-of-range rows). Sample confirmed row: StoreCode
+      E222, Reference BCDN00002ICE, Qty_7d=1, Qty_28d=10,
+      StockOnHandQty=15, DaysWithoutStock_7d=0, DaysWithoutStock_28d=0,
+      SellThrough_7d_pct=6.25, SellThrough_28d_pct=40.0,
+      StockAdjustedFactor_pct=(28-0)/28×100=100.0 (added 2026-08-28 — a
+      pure arithmetic transform of already-verified DaysWithoutStock_28d,
+      not independently re-queried; correctness follows directly from
+      view_3's DaysWithoutStock_28d verification).
+
+  view_5_store_family_demand_index:
+    status: "CONFIRMED, live-tested end-to-end 2026-08-28 (BOYS CORE DENIM / offline_sales) — W3"
+    purpose: >
+      Per Pugal's confirmed approach (see decisions.w3_normalization/
+      w3_window): compute each store's Store Demand Index for the plan's
+      Family — this IS W3. Unlike view_2/view_3/view_4, this is NOT at
+      Reference grain — it aggregates ALL References/Item Codes under the
+      Family together, per store, since W3 measures a store's overall
+      demand share for the Family, not per-SKU sell-through.
+    formula: >
+      StoreShare(S) = FamilyQty_28d(S) / NetworkTotal_28d
+      FairShare = 1 / (count of stores with FamilyQty_28d > 0, i.e. stores
+        that sold this Family at all in the window)
+      DemandIndex(S) = StoreShare(S) / FairShare
+      StoreDemandIndex_pct(S) = PERCENTILE RANK of DemandIndex(S) among
+        all stores that sold the Family, using the mean-rank method:
+        (sorted_position / (n_stores - 1)) × 100, so the lowest-demand
+        store = 0%, the highest-demand store = 100%.
+      28-day window, corrected -27 offset (same convention as view_2/
+      view_3 — see decisions.anchor_date), anchored on offline_sales' own
+      MAX(SALE_TRANS_DATE) (same anchor as view_2, NOT store_invdetails').
+    implementation_note: >
+      Simpler than view_2/view_3/view_4 — this does NOT need per-Item-Code
+      pagination. The whole aggregation (SUM(SALE_TOT_QTY) GROUP BY
+      STORE_CODE, filtered to the family's Item Codes and the 28-day
+      window) is pushed entirely into ONE SQL query against offline_sales
+      — the result set is only as large as the number of distinct stores
+      selling the family (168 in the test scope), far under any
+      raw_json truncation risk. Percentile ranking and DemandIndex math
+      happen client-side on that small result set.
+    verified_facts: >
+      Live-tested end-to-end 2026-08-28 against Calendar plan A's scope
+      (family=BOYS CORE DENIM): 191 Item Codes resolved (same
+      product_master step as view_2/view_3/view_4). Store-grouped SQL
+      query returned 168 distinct STORE_CODE rows (raw_json, NOT
+      truncated — confirmed via the response's own `truncated: false`).
+      Cross-validated: SUM of the 168 per-store totals = 7,339, exactly
+      matching a SEPARATE direct SUM(SALE_TOT_QTY)/COUNT(DISTINCT
+      STORE_CODE) query run independently (also 7,339 / 168) — confirms
+      no double-counting or missed rows. Zero stores had a negative
+      FamilyQty_28d in this test scope (unlike view_4's 5/692 rows —
+      family-level aggregation apparently smooths out the individual
+      Reference-level return anomalies seen there, though this is an
+      observation from one test scope, not a guarantee it never happens).
+      Percentile range confirmed to span exactly [0.0, 100.0] as
+      expected. Sample rows: E224 (lowest demand: qty=6,
+      DemandIndex=0.137, Percentile=0.0), E175 (near-median: qty=40,
+      DemandIndex=0.916, Percentile=51.5), E087 (highest demand: qty=158,
+      DemandIndex=3.617, Percentile=100.0).
+    resolved_note: >
+      RESOLVED 2026-08-28 — this view's output (StoreCode,
+      StoreDemandIndex_pct) is now LEFT JOINed into the final SSP
+      computation, keyed by StoreCode only (per
+      decisions.view4_view5_join_type) — every Reference under the same
+      Store+Family shares the same StoreDemandIndex_pct value, as
+      expected for a Family-grain metric. See the computation section.
+
+  view_reference_size_bridge:
+    status: "IDENTIFIED, not yet built into a query used by another view"
+    purpose: >
+      Bridges store_sku_min_display_mapping's ProdReference+Size grain to
+      product_master's Item Code (needed anywhere this playbook must go
+      from a Size-level MinDisplay/threshold row to the Item Code used by
+      sales/stock datasets — not needed by view_2 above, which works at
+      Reference grain, not Size grain).
+    sql: >
+      SELECT DISTINCT `Reference`, `Size`, `Item Code`, `Family` FROM
+      product_master WHERE `Reference` <> ''
+    verified_facts: >
+      Live-tested: `Reference`+`Size` is 1:1 to `Item Code` in the
+      overwhelming majority of cases (confirmed against BOYS CORE
+      DENIM/BCDN00001INDIGO — Size format matches exactly between
+      product_master, e.g. "2Y".."14Y", and
+      store_sku_min_display_mapping's Size column). NOT perfectly 1:1
+      globally: a live query found 10 Reference+Size combos mapping to
+      >1 Item Code — 9 are a handful of genuine small collisions, and 1
+      is a blank-Reference artifact (empty Reference + "FREE SIZE" maps
+      to 506 distinct Item Codes) — excluded by the `Reference <> ''`
+      filter above. The 9 genuine collisions are NOT resolved — flagged
+      here, not silently picked one way.
+
+      product_master also has literal DUPLICATE rows (same Item
+      Code/Reference/Size repeated) — confirmed live (BCDN00001INDIGO
+      sample showed each row twice) — DISTINCT is required, same as
+      eligibility.yml's step_3.
+
+# ── Datasets (new to this playbook; product_master/offline_sales reuse eligibility.yml's/handoff's confirmed IDs) ──
+datasets:
+  store_sku_min_display_mapping:
+    alias: "store_sku_min_display_mapping"
+    domo_dataset_name: "Store_Sku_Min_Display_mapping.xlsx"
+    confirmed_id: "2ee08d66-2eec-43af-a711-a7505a325629"
+    grain: "One row per StoreCode + ProdReference + Size — CONFIRMED live 2026-08-27 (245,175 rows, 5 columns). Calendar/playbook/calender.yml's entry for this dataset had grain/relevant_columns unconfirmed; this playbook is the first to actually inspect it."
+    relevant_columns: ["StoreCode", "ProdReference", "Size", "MinDisplay", "Sales Threshold %"]
+    usage_in_this_playbook: >
+      view_1_prodref_sales_threshold (aggregation only, per Pugal — not
+      compared against stores yet) and, later, view_reference_size_bridge
+      for any Size-level MinDisplay use.
+  offline_sales:
+    alias: "offline_sales"
+    domo_dataset_name: "DEV|OUT|Saleline Store"
+    confirmed_id: "c0cf2361-2f31-4df0-9c00-cb659351ebe2"
+    grain: "Transaction-line grain (SALE_TRANS_DATE, STORE_CODE, PRODUCT_CODE, SALE_TRANS_NO, SALE_LINE_NO, ...) — CONFIRMED live 2026-08-27 (59,137,732 rows, 32 columns). STORE_CODE here is a RETAIL store code (unlike warehouse_invdetails, where the same-named column means warehouse) — not yet cross-verified against store_master, but expected."
+    relevant_columns: ["SALE_TRANS_DATE", "STORE_CODE", "PRODUCT_CODE", "SALE_TOT_QTY"]
+    usage_in_this_playbook: >
+      view_2_store_reference_sales_qty — see decisions.view_1_sales_source
+      (offline only for now, online_sales deferred).
+  online_sales:
+    alias: "online_sales"
+    domo_dataset_name: "DEV|OUT|Saleline Ecom"
+    confirmed_id: "4bfd9098-b259-427a-90bd-17a30e5aab93"
+    grain: "Same transaction-line shape as offline_sales — CONFIRMED live 2026-08-27 (3,191,381 rows, 34 columns): SALE_TRANS_DATE, STORE_CODE, PRODUCT_CODE, SALE_TOT_QTY all present."
+    relevant_columns: ["SALE_TRANS_DATE", "STORE_CODE", "PRODUCT_CODE", "SALE_TOT_QTY"]
+    usage_in_this_playbook: >
+      NOT YET USED — deferred per decisions.view_1_sales_source. Listed
+      here so its confirmed schema is on record for when it's wired in.
+  store_invdetails:
+    alias: "store_invdetails"
+    domo_dataset_name: "SU_Store_Inventory"
+    confirmed_id: "c4acfdfb-e9c8-4bd6-97e1-9ad4c85eedc2"
+    grain: "DATE + STORE_CODE + PRODUCT_CODE daily snapshot — CONFIRMED live 2026-08-27 (3,223,393,385 rows, 21 columns). NOTE: live Domo schema name is 'SU_Store_Inventory', not 'SU_Store_Invdetails' as SESSION_HANDOFF.md/calender.yml call it — same dataset ID, just a naming drift worth flagging."
+    relevant_columns: ["DATE", "STORE_CODE", "PRODUCT_CODE", "STOCK_ONHAND_QTY"]
+    usage_in_this_playbook: >
+      view_3_store_reference_stock_onhand and view_4 (W4
+      StockAdjustedFactor_pct) — both CONFIRMED, live-tested end-to-end,
+      including in the full computation pipeline (see computation
+      section).
+  performance:
+    alias: "performance"
+    domo_dataset_name: "DEV|OUT|Rytail Product Performance"
+    confirmed_id: "ff243d9a-1d5f-42d9-b2d4-44847df66ff2"
+    grain: "CONFIRMED live 2026-08-27 (17,922,367 rows, 79 columns) — includes storeCode, reference, family, transactionDate, sellThru%, ros%, cluster, storeGroup, tier, stockOnhandQty among others."
+    relevant_columns: []
+    usage_in_this_playbook: >
+      NOT USED for W1/W2 — explicitly rejected as the sell-through source
+      (see decisions.sell_through_source). Listed here only because its
+      schema was inspected and is on record; may be reconsidered for
+      other uses later, but do not use its sellThru%/ros% columns for
+      this playbook's SSP calc without an explicit decision to do so.
+  ssp_eligible_stores:
+    alias: "ssp_eligible_stores"
+    domo_dataset_name: "SSP_eligibility_Final"
+    confirmed_id: "a1bf0a87-d46a-48a3-a4c0-7fc47d3137c5"
+    status: >
+      OUTPUT dataset, not a source — created 2026-08-28 via
+      create_domo_dataset (dry-run previewed first, then confirm=True).
+      This is the THIRD dataset in this playbook's persistence saga — see
+      decisions.schema_fix_history_2026_08_28 for the full story
+      (a 12-column first attempt missing 3 columns, a failed in-place
+      REPLACE, two new MCP tools added, and this final 15-column
+      dataset). The original "SSP Eligible Stores" (12 columns, id
+      4e508e9f-cd26-4352-ada5-792569fcd6c9) is now ORPHANED — do not use
+      that ID, it is superseded and no longer referenced by
+      mcp_sever 1.py. APPEND-ONLY from the second run onward — see
+      decisions.ssp_eligible_stores_persistence for the full write
+      convention (RunId sequencing). Registered in mcp_sever 1.py's
+      MODULE_DATASETS["replenishment"] and confirmed live via
+      get_replenishment_dataset_ids() after a server restart.
+    grain: "One row per StoreCode + Reference + CalendarPlanName + RunId. 276 rows as of the first run (2026-08-28, Calendar plan A, RunId=1)."
+    columns: ["StoreCode", "Reference", "Qty_7d", "Qty_28d", "StockOnHandQty", "SellThrough_7d_pct", "SellThrough_28d_pct", "StoreDemandIndex_pct", "StockAdjustedFactor_pct", "SSP", "SalesThresholdPct", "Eligible", "CalendarPlanName", "RunId", "computedAt"]
+    notes: >
+      Eligible is stored as STRING ("True"/"False"), not a native
+      boolean — create_domo_dataset's type inference only supports
+      STRING/LONG/DOUBLE/DATE. computedAt is also STRING (an ISO 8601 UTC
+      timestamp — the tool's inference did not recognize this format as
+      DATE). Only rows with a defined Sales Threshold % are included (see
+      decisions.threshold_coverage_gap) — References outside
+      store_sku_min_display_mapping's current coverage never appear here.
+      Qty_7d/Qty_28d/StockOnHandQty are the RAW (unclamped) values from
+      view_2/view_3 — unlike SellThrough_Nd_pct, these are NOT
+      negative-clamped, so a genuine data anomaly (e.g. net returns) would
+      show as a negative number here even though it was clamped to 0 for
+      the SSP calc itself (see decisions.negative_value_clamping).
+    usage_in_this_playbook: >
+      computation's persisted output — see computation section and
+      decisions.ssp_eligible_stores_persistence.
+
+# ── Computation ──
+computation:
+  status: >
+    CONFIRMED, LIVE-TESTED END-TO-END 2026-08-28 — the full SSP +
+    eligibility pipeline is now built and verified against Calendar plan
+    A's scope (family=BOYS CORE DENIM). This is the first complete
+    run of REPL-SPE-01's core computation.
+  pipeline: >
+    1. Resolve family scope: product_master Item Code → Reference map
+       (191 Item Codes, 47 References for the test family).
+    2. Resolve threshold coverage: JOIN the 47 References against
+       store_sku_min_display_mapping's ProdReference (view_1's source) —
+       only References WITH a defined Sales Threshold % proceed (7 of 47
+       in the test scope — see decisions.threshold_coverage_gap). This
+       narrows the Item Code scope for steps 3-5 to just those
+       References' Item Codes (49 of 191) — a deliberate optimization,
+       not a correctness requirement.
+    3. Build view_2 (sales) and view_3 (stock, incl. DaysWithoutStock_28d)
+       scoped to the narrowed Item Code set, per their own definitions.
+    4. Build view_4: INNER JOIN view_2/view_3 on (StoreCode, Reference),
+       compute SellThrough_7d_pct, SellThrough_28d_pct (W1, W2, with
+       negative-value clamping) and StockAdjustedFactor_pct (W4).
+    5. Build view_5: Store Demand Index (W3), computed over the FULL
+       family scope (all 191 Item Codes / 47 References) — NOT narrowed
+       to the 7 thresholded References, since W3 measures a store's
+       demand share of the WHOLE family, independent of which specific
+       References happen to have a threshold defined.
+    6. LEFT JOIN view_4 with view_5 by StoreCode (decisions.
+       view4_view5_join_type) — missing StoreDemandIndex_pct → 0.
+    7. Compute SSP = 0.40×SellThrough_7d_pct + 0.30×SellThrough_28d_pct +
+       0.15×StoreDemandIndex_pct + 0.15×StockAdjustedFactor_pct for every
+       (StoreCode, Reference) row that has both a view_4 result AND a
+       defined threshold (step 2's narrowing already guarantees the
+       threshold; rows lacking StockAdjustedFactor_pct — i.e. no
+       DaysWithoutStock data — are skipped, not defaulted).
+    8. Eligible = (SSP >= SalesThresholdPct) — decisions.
+       ssp_threshold_comparison.
+  verified_facts: >
+    Live-tested end-to-end 2026-08-28, Calendar plan A (family=BOYS CORE
+    DENIM): 7 of 47 References had a defined threshold (25% for
+    BCDN00001INDIGO/BCDN00002GREY, 30% for the four BCDN00003* variants).
+    Scoped to 49 Item Codes → view_2: 765 Store+ProductCode-level rows
+    (before Reference re-aggregation) → view_3 b1: 265 Store+Reference
+    pairs, b2: 286 pairs → view_4 (INNER JOIN): 276 Store+Reference pairs
+    → view_5: 168 stores with a DemandIndex (full-family scope, same as
+    the standalone view_5 test). FINAL: 276 Store+Reference rows with a
+    computed SSP and a defined threshold (every view_4 row had
+    StockAdjustedFactor_pct available in this test — none skipped for
+    that reason). ALL 276 SSP values fell within [0,100] (sanity check
+    passed). 244 of 276 (88%) came out Eligible (SSP >= threshold).
+    Sample row: StoreCode E081, Reference BCDN00002GREY,
+    SellThrough_7d_pct=50.0, SellThrough_28d_pct=80.0,
+    StoreDemandIndex_pct=20.96, StockAdjustedFactor_pct=100.0, SSP=62.14,
+    SalesThresholdPct=25, Eligible=True. OBSERVATION (not yet
+    investigated further): StockAdjustedFactor_pct was 100.0 for every
+    row shown in the sample output — plausible for this specific
+    narrow/well-stocked test scope (only 49 Item Codes across 7
+    References), but not confirmed as a general pattern across the whole
+    catalog; flagged for awareness, not treated as a bug.
+  output_schema: >
+    StoreCode, Reference, Qty_7d, Qty_28d, StockOnHandQty (raw, unclamped —
+    added 2026-08-28 per Pugal), SellThrough_7d_pct, SellThrough_28d_pct,
+    StoreDemandIndex_pct, StockAdjustedFactor_pct, SSP, SalesThresholdPct,
+    Eligible (boolean in the computed result; stored as STRING
+    "True"/"False" in the persisted Domo dataset — see
+    datasets.ssp_eligible_stores.notes).
+  persistence: >
+    RESOLVED 2026-08-28 (with Pugal): output is written to a NEW Domo
+    dataset, "SSP Eligible Stores" (confirmed_id
+    4e508e9f-cd26-4352-ada5-792569fcd6c9), created via create_domo_dataset
+    2026-08-28 — see datasets.ssp_eligible_stores below and
+    decisions.ssp_eligible_stores_persistence for the full convention
+    (first-run creation vs. append-going-forward, RunId semantics).
+    eligibility.yml's own persistence note (for the zero-stock rule) is
+    STILL separately unresolved — this resolution is SPE-01-specific,
+    not a precedent automatically applied there.
+
+# ── Guardrails ──
+guardrails:
+  - "This playbook EXTENDS eligibility.yml (REPL-ELIG-01) — it does not redefine eligibility.yml's scheduling/scope-isolation architecture or its zero-stock rule (step_5). Read eligibility.yml first; this file only covers the non-zero-stock (SSP) case."
+  - "Do not invent the still-TBD parts of the SSP formula (sell-through denominator, demand-index formula, stock-adjustment formula, normalization, threshold comparison operator) — see decisions and computation.status above. Only what's explicitly confirmed and live-tested is safe to build on."
+  - "query_dataset operates on ONE Domo dataset per call — there is no cross-dataset SQL JOIN. Every 'view' in this file that spans two datasets (e.g. view_2) is a CLIENT-SIDE merge of two separate single-dataset queries, not one SQL statement. Do not attempt a JOIN clause across dataset_ids."
+  - "offline_sales/online_sales/store_invdetails windows ('last N days') anchor on MAX(SALE_TRANS_DATE) or MAX(DATE) from the table itself, NOT system current date — live-tested gap of ~23 days between offline_sales' latest data and system today (2026-08-27). Same pattern as eligibility.yml's step_2."
+  - "'Last N days' means N calendar days INCLUSIVE of the anchor date: DATE >= DATE_ADD(anchor, -(N-1)) AND DATE <= anchor (i.e. -6/-27 for 7/28 days, NOT -7/-28). The -7/-28 form is an off-by-one that spans 8/29 days — see decisions.anchor_date. view_2's step (b) SQL still needs re-running with this fix; view_3's DaysWithoutStock queries already use the corrected form."
+  - "Sales Threshold % aggregation (view_1) is aggregation ONLY — per Pugal, do not compare it against any store's SSP until the full SSP calc is defined and this file is updated to say so explicitly."
+  - "online_sales is confirmed schema-compatible but deliberately NOT included in view_2 yet (offline_sales only) — do not assume sales quantities anywhere in this playbook already include online channel data until decisions.view_1_sales_source is updated."
+  - "Same scope_isolation_guardrail as eligibility.yml: every query here filters to ONE Calendar Plan's own productFamily (and, once store-level scoping is added, its own store_mapping) — never blend two plans' scopes even on a shared run day."
+  - "product_master has literal duplicate rows and its Reference+Size is not perfectly 1:1 to Item Code (10 known collision combos, 1 of which is a blank-Reference data artifact) — always DISTINCT, and be aware the collision cases are unresolved, not silently picked."
+  - "store_invdetails' live Domo schema name is 'SU_Store_Inventory', not 'SU_Store_Invdetails' — same ID (c4acfdfb-e9c8-4bd6-97e1-9ad4c85eedc2), just flagging the naming drift from SESSION_HANDOFF.md/calender.yml."
+  - "query_dataset's raw_json=True mode silently truncates PAYLOAD-SIZE-based, not by a fixed row count (a wider query truncates at fewer rows) — no error, just a `truncated` flag. NEVER infer 'last page' from `got < requested LIMIT` alone — this silently dropped 114,413 of 115,838 rows on the first DaysWithoutStock attempt. Always check `truncated` per page and cross-validate the final total against COUNT(*). See decisions.raw_json_pagination_cap for the corrected pattern (validated end-to-end on view_3's b1 and b2)."
+  - "store_invdetails' latest snapshot is ~6.5 months stale (2026-02-06 vs system-today 2026-08-27) — see decisions.store_stock_staleness. Do not treat view_3's stock figures as fresh/current without surfacing this; it is an OPEN question with Pugal, not resolved."
+  - "W1/W2 sell-through formula is CONFIRMED and live-tested (view_4): SellThrough_Nd% = MAX(Qty_Nd,0) / (MAX(Qty_Nd,0) + MAX(StockOnHandQty,0)) × 100, negative inputs clamped to 0, 0/0 → 0%. view_4's INNER JOIN of view_2/view_3-combined drops non-matching pairs (1,244 ∩ 738 → 692 in the test scope) — a confirmed, deliberate data-loss tradeoff, not a bug. See decisions.negative_value_clamping and decisions.view2_view3_join_type."

@@ -1,0 +1,56 @@
+:root {
+  /* Brand */
+  --ry-primary: #176B45;        /* Forest Green — primary actions, active nav */
+  --ry-primary-hover: #12573A;
+  --ry-primary-pressed: #0E4630;
+  --ry-accent: #2F9E62;         /* Accent Green — highlights, positive deltas */
+  --ry-sage: #E8F3EC;           /* Sage — selected rows, subtle fills, nav hover */
+  --ry-sage-strong: #D3E8DA;
+
+  /* Surfaces */
+  --ry-bg: #FAFBF9;             /* app background */
+  --ry-card: #FFFFFF;
+  --ry-border: #DDE5DE;
+  --ry-border-strong: #C5D1C8;
+
+  /* Text */
+  --ry-text: #27352E;
+  --ry-text-muted: #69766D;
+  --ry-text-on-primary: #FFFFFF;
+
+  /* Semantic */
+  --ry-warning: #B7791F;  --ry-warning-bg: #FEF6E7;   /* amber */
+  --ry-danger:  #C53030;  --ry-danger-bg:  #FDECEC;   /* red — errors, critical shortage */
+  --ry-info:    #2B6CB0;  --ry-info-bg:    #EBF4FD;   /* blue */
+  --ry-success: #2F9E62;  --ry-success-bg: #E8F3EC;
+  --ry-inactive:#8A948D;  --ry-inactive-bg:#F1F3F1;   /* gray */
+
+  /* AI suggestion */
+  --ry-ai: #5B4FC4;       --ry-ai-bg: #F3F1FD;        /* distinct from verified data */
+
+  /* Shape & depth */
+  --ry-radius-sm: 6px; --ry-radius: 10px; --ry-radius-lg: 14px;
+  --ry-shadow-sm: 0 1px 2px rgba(39,53,46,.06);
+  --ry-shadow:    0 2px 8px rgba(39,53,46,.08);
+
+  /* Layout */
+  --ry-sidebar-w: 248px; --ry-sidebar-w-collapsed: 68px; --ry-topbar-h: 56px;
+}
+
+/* Dark mode theme overrides */
+[data-theme="dark"], .dark {
+  --ry-bg: #0F1714;
+  --ry-card: #18221D;
+  --ry-border: #24352D;
+  --ry-border-strong: #2F453A;
+  --ry-text: #E8F0EB;
+  --ry-text-muted: #95A59B;
+  --ry-sage: #1C2E25;
+  --ry-sage-strong: #243E31;
+  --ry-warning-bg: #2B2111;
+  --ry-danger-bg: #301717;
+  --ry-info-bg: #142336;
+  --ry-success-bg: #152A1E;
+  --ry-inactive-bg: #222B25;
+  --ry-ai-bg: #1F1B38;
+}

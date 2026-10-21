@@ -1,0 +1,329 @@
+playbook_id: "REPL-ORD-01"
+playbook_name: "Store Replenishment Order Allocation Playbook"
+short_name: "store_replenishment_order_allocation"
+
+description: >
+  Next-Step Replenishment Order Allocation Engine. Operates ON TOP OF the confirmed
+  Store Sales Probability eligibility output (`SSP_eligibility_Final`, REPL-SPE-02).
+  
+  CORE OPERATIONAL WORKFLOW:
+  1. CALENDAR PLAN CADENCE & STATUS CHECK:
+     Inspect `calendar_plans` (`a21b4d4b-6edd-4a02-b2e3-d87ba71045ff`).
+     - Check `status == 'active'` (only active plans run; draft or archived plans are ignored).
+     - Check `runCadence` column (e.g. "Monday,Friday").
+       MANUAL TRIGGER RULE: Any user prompt or command to run replenishment (e.g. "Run replenishment for Calendar plan A") is an explicit manual trigger that automatically executes immediately regardless of current day. NEVER pause or ask the user to confirm off-cadence execution.
+     - Extract `planName`, `warehouse`, and `productFamily` for the replenishment scope.
+  2. ELIGIBLE SCOPE FROM SSP_ELIGIBILITY_FINAL:
+     - Compare and match values with the active Calendar Plan using the `CalendarPlanName` column (`CalendarPlanName == planName`).
+     - Filter rows by `Eligible` column where the value is `'True'`.
+     - Filter by the specific client-required `RunId` (`target_run_id`, no MAX(RunId)).
+     - Extract the `StoreCode` and `Reference` columns from this dataset for the next analysis steps.
+  3. DEMAND MATRIX EXPANSION:
+     Expands each eligible store + reference pair into required sizes and target MinDisplay
+     from `Store_Sku_Min_Display_mapping` (`7491b7c0`).
+  4. INVENTORY AGGREGATION & SIZE RESOLUTION:
+     Enriches blank sizes via `SU_Product_Master` (`7fb59cab`), clamps negative values to 0,
+     and sums `Current Stock Qty` + `Ordered Qty` from `Replenishment Order Details` (`8152de75`).
+  5. REPLENISH-ONLY ROWS (DEFICIT > 0):
+     Computes ReplenishmentQtyToSend = MinDisplay - TotalEffectiveStock.
+     Output ONLY rows where ReplenishmentQtyToSend > 0.
+  6. NO WAREHOUSE STOCK COLUMN:
+     Warehouse stock column is completely omitted from the output.
+
+execution_trigger:
+  policy: "AUTOMATIC_AFTER_REPL_SPE_02"
+  upstream_playbook: "sales_probability_eligibility_v2.yml"
+  upstream_playbook_id: "REPL-SPE-02"
+  description: >
+    This playbook is designed to execute IMMEDIATELY following REPL-SPE-02.
+    When triggered after Gate G4 of REPL-SPE-02, it automatically receives:
+      - `target_plan_name`: CalendarPlanName of the active plan (e.g. 'Calendar plan A')
+      - `target_run_id`: The exact RunId newly appended to SSP_eligibility_Final (e.g. 3)
+    The agent must run this stage seamlessly without stopping or prompting for user input.
+
+# ── Datasets Required ────────────────────────────────────────────────────────
+datasets:
+  calendar_plans:
+    domo_dataset_name: "calendar_plans"
+    confirmed_id: "a21b4d4b-6edd-4a02-b2e3-d87ba71045ff"
+    usage: >
+      Source of truth for plan configuration: planName, warehouse, productFamily,
+      runCadence, status, and rowSeq.
+
+  ssp_eligibility_final:
+    domo_dataset_name: "SSP_eligibility_Final"
+    confirmed_id: "a1bf0a87-d46a-48a3-a4c0-7fc47d3137c5"
+    usage: >
+      Upstream scored eligibility output. Contains StoreCode, Reference, CalendarPlanName,
+      RunId, and Eligible. Matched by CalendarPlanName, filtered by Eligible = 'True'
+      and RunId = target_run_id to extract eligible StoreCode and Reference columns.
+
+  store_sku_min_display_mapping:
+    domo_dataset_name: "Store_Sku_Min_Display_mapping"
+    confirmed_id: "7491b7c0-28e1-46fb-804f-79e69b714dc3"
+    status: "STRICTLY READ-ONLY INPUT DATASET"
+    usage: >
+      Master Demand Matrix. Sourced to expand each StoreCode + Reference pair into
+      its required Size combinations and extract the target MinDisplay quantity per size.
+      DO NOT modify, update, or overwrite this dataset.
+
+  replenishment_order_details:
+    domo_dataset_name: "DEV Replenishment Order Details"
+    confirmed_id: "8152de75-f313-47f6-a50c-48b524fcb503"
+    usage: >
+      Store inventory ledger. Supplies Current Stock Qty and Ordered Qty per store,
+      product code, and reference.
+
+  product_master:
+    domo_dataset_name: "SU_Product_Master"
+    confirmed_id: "7fb59cab-dd64-4821-a55f-2276d808bfc3"
+    usage: >
+      Size Resolution Bridge. In Replenishment Order Details, Size is blank on ~63% of
+      rows. Product Master maps Sale Product Code (Item Code) 1:1 to the true Size.
+
+# ── Execution Pipeline ───────────────────────────────────────────────────────
+pipeline:
+
+  # ---------------------------------------------------------------------------
+  # STEP 0: Calendar Plan Cadence, Status & Scope Resolution
+  # ---------------------------------------------------------------------------
+  step_0_cadence_and_scope:
+    description: >
+      Inspect calendar_plans to identify active plans scheduled to run today.
+      Never process all plans at once.
+    dataset: "calendar_plans (a21b4d4b-6edd-4a02-b2e3-d87ba71045ff)"
+    sql: |
+      SELECT planName, warehouse, productFamily, runCadence, status, rowSeq
+      FROM table
+      WHERE status = 'active'
+      ORDER BY rowSeq DESC
+    logic: >
+      1. Filter for status == 'active'. Ignore any draft or archived plans.
+      2. Take the latest record per planName (highest rowSeq).
+      3. Cadence Evaluation:
+         - Inspect the `runCadence` column (e.g. "Monday,Friday").
+         - Split by comma into day names: `cadence_days = [d.strip() for d in runCadence.split(',')]`.
+         - If current execution day (e.g. Monday) is in `cadence_days`, the plan is DUE.
+         - MANUAL OVERRIDE RULE: When triggered by a user prompt or command (e.g. "Run replenishment for Calendar plan A"), the run is an authorized manual execution. Proceed immediately without pausing to ask for user confirmation.
+      4. Scope Extraction:
+         - Extract `planName` (e.g. 'Calendar plan A')
+         - Extract `warehouse` (e.g. 'H01')
+         - Extract `productFamily` (e.g. 'BOYS CORE DENIM')
+         - Extract `storeMappingFileId`
+
+  # ---------------------------------------------------------------------------
+  # STEP 1: Eligible Scope from SSP_eligibility_Final (CalendarPlanName + Eligible == 'True')
+  # ---------------------------------------------------------------------------
+  step_1_eligible_scope:
+    description: >
+      Compare values with the active Calendar Plan using the CalendarPlanName column,
+      filter rows where Eligible == 'True' for the client's RunId, and extract the
+      StoreCode and Reference columns.
+    dataset: "ssp_eligibility_final (a1bf0a87-d46a-48a3-a4c0-7fc47d3137c5)"
+    input_parameters:
+      - target_plan_name: "Name of the active calendar plan (planName from Step 0)"
+      - target_run_id: "Specific RunId requested by client / upstream execution"
+    sql: |
+      SELECT StoreCode, Reference, CalendarPlanName, RunId, computedAt
+      FROM table
+      WHERE CalendarPlanName = '{target_plan_name}'
+        AND RunId = {target_run_id}
+        AND Eligible = 'True'
+    extracted_columns:
+      - StoreCode: "Store Identifier (e.g. E0100, E188)"
+      - Reference: "Product Reference Code (e.g. BCDN00001INDIGO)"
+    logic: >
+      1. Match `CalendarPlanName` against the active calendar plan's `planName` from Step 0.
+      2. Filter by `RunId == target_run_id` (client-specified run).
+      3. Filter by `Eligible == 'True'` (strictly approved pairs only).
+      4. Extract the unique `StoreCode` and `Reference` pairs to drive the demand matrix in Step 2.
+
+  # ---------------------------------------------------------------------------
+  # STEP 2: Demand Matrix Expansion (Target Sizes & MinDisplay)
+  # ---------------------------------------------------------------------------
+  step_2_demand_matrix:
+    description: >
+      Expand each eligible StoreCode + Reference pair into its complete set
+      of active product sizes and minimum display targets.
+    dataset: "store_sku_min_display_mapping (7491b7c0-28e1-46fb-804f-79e69b714dc3)"
+    sql: |
+      SELECT StoreCode, ProdReference, Size, MinDisplay
+      FROM table
+      WHERE StoreCode IN ({eligible_stores})
+        AND ProdReference IN ({eligible_references})
+    logic: >
+      Inner join with Step 1 eligible pairs on StoreCode and ProdReference = Reference.
+      This defines the demand matrix: which sizes each store must display and in what quantity.
+
+  # ---------------------------------------------------------------------------
+  # STEP 3: Store Stock Aggregation & Size Enrichment
+  # ---------------------------------------------------------------------------
+  step_3_store_inventory:
+    description: >
+      Retrieve store stock on hand and pending orders from Replenishment Order Details,
+      resolve missing sizes via Product Master, and compute total effective stock.
+    datasets:
+      - "replenishment_order_details (8152de75-f313-47f6-a50c-48b524fcb503)"
+      - "product_master (7fb59cab-dd64-4821-a55f-2276d808bfc3)"
+    sql_order_details: |
+      SELECT `Sale Store Code` AS StoreCode,
+             `Sale Product Code` AS ProductCode,
+             Reference,
+             Size,
+             `Current Stock Qty` AS CurrentStockQty,
+             `Ordered Qty` AS OrderedQty
+      FROM table
+      WHERE `Sale Store Code` IN ({eligible_stores})
+        AND Reference IN ({eligible_references})
+    logic: >
+      1. For rows where Size is empty or blank, resolve via SU_Product_Master:
+         ResolvedSize = COALESCE(NULLIF(TRIM(Size), ''), Product_Master.Size)
+      2. Zero-floor clamping:
+         CurrentStock = MAX(0, CurrentStockQty)
+         OrderedStock = MAX(0, OrderedQty)
+      3. Aggregate by (StoreCode, Reference, ResolvedSize):
+         TotalEffectiveStock = SUM(CurrentStock + OrderedStock)
+
+  # ---------------------------------------------------------------------------
+  # STEP 4: Compare vs MinDisplay & Filter Replenish-Only Rows
+  # ---------------------------------------------------------------------------
+  step_4_replenishment_deficit:
+    description: >
+      LEFT JOIN Demand Matrix with Store Stock, calculate the replenishment deficit,
+      and strictly filter for rows where ReplenishmentQtyToSend > 0.
+    formula: |
+      EffectiveStoreStock = COALESCE(store_stock_agg.TotalEffectiveStock, 0)
+      ReplenishmentDeficit = MAX(0, MinDisplay - EffectiveStoreStock)
+    filter_rule: >
+      STRICT REPLENISH-ONLY RULE:
+      Only include rows where ReplenishmentDeficit > 0.
+      If EffectiveStoreStock >= MinDisplay, drop the row completely.
+    output_columns:
+      - StoreCode
+      - ProdReference
+      - Size
+      - MinDisplay
+      - CurrentStockQty
+      - OrderedQty
+      - TotalEffectiveStock
+      - ReplenishmentQtyToSend
+      - CalendarPlanName
+      - RunId
+      - computedAt
+    mandatory_output_grain_rule: >
+      STRICT SKU-SIZE GRAIN MANDATE:
+      The resultant replenishment dispatch table MUST ALWAYS be output at the SKU-Size grain, explicitly including the `Size` column:
+      (StoreCode, ProdReference, Size, MinDisplay, TotalEffectiveStock, ReplenishmentQtyToSend).
+      NEVER aggregate, group by, or roll up rows to (StoreCode, Reference) level.
+      Warehouse fulfillment requires the exact physical garment size (e.g. 2Y, 4Y, 6Y, 8Y, 10Y, 12Y, 14Y) on every dispatch line.
+
+# ── Optimized High-Speed SQL Query (Parameterized by Client RunId) ───────────
+unified_sql_query: |
+  WITH 
+  -- Pass 1: Eligible Demand Matrix (CalendarPlanName match & Eligible == 'True')
+  eligible_demand AS (
+      SELECT 
+          s.StoreCode,
+          s.Reference AS ProdReference,
+          m.Size,
+          m.MinDisplay,
+          s.CalendarPlanName,
+          s.RunId,
+          s.computedAt
+      FROM ssp_eligibility_final s
+      INNER JOIN store_sku_min_display_mapping m
+          ON s.StoreCode = m.StoreCode
+         AND s.Reference = m.ProdReference
+      WHERE s.CalendarPlanName = :target_plan_name
+        AND s.RunId = :target_run_id
+        AND s.Eligible = 'True'
+  ),
+
+  -- Pass 2: Pre-Filtered Store Stock (Predicate Pushdown to Eligible References)
+  store_inventory AS (
+      SELECT 
+          rod.`Sale Store Code` AS StoreCode,
+          rod.Reference AS ProdReference,
+          COALESCE(NULLIF(rod.Size, ''), pm.Size) AS Size,
+          SUM(GREATEST(0, rod.`Current Stock Qty`) + GREATEST(0, rod.`Ordered Qty`)) AS TotalEffectiveStock
+      FROM replenishment_order_details rod
+      INNER JOIN (SELECT DISTINCT ProdReference FROM eligible_demand) ed
+          ON rod.Reference = ed.ProdReference
+      LEFT JOIN su_product_master pm
+          ON rod.`Sale Product Code` = pm.`Item Code`
+      GROUP BY 
+          rod.`Sale Store Code`,
+          rod.Reference,
+          COALESCE(NULLIF(rod.Size, ''), pm.Size)
+  )
+
+  -- Final Pass: Left Join & Filter for Deficit > 0 (Replenish Only)
+  SELECT 
+      d.StoreCode,
+      d.ProdReference,
+      d.Size,
+      d.MinDisplay,
+      COALESCE(i.TotalEffectiveStock, 0) AS TotalEffectiveStock,
+      (d.MinDisplay - COALESCE(i.TotalEffectiveStock, 0)) AS ReplenishmentQtyToSend,
+      d.CalendarPlanName,
+      d.RunId,
+      d.computedAt
+
+  FROM eligible_demand d
+  LEFT JOIN store_inventory i
+      ON d.StoreCode = i.StoreCode
+     AND d.ProdReference = i.ProdReference
+     AND d.Size = i.Size
+
+  -- STRICT USER RULE: Only rows that need replenishment (Deficit > 0)
+  WHERE COALESCE(i.TotalEffectiveStock, 0) < d.MinDisplay
+
+  ORDER BY 
+      d.StoreCode,
+      d.ProdReference,
+      d.Size;
+
+# ── Guardrails ───────────────────────────────────────────────────────────────
+guardrails:
+  - id: "GR-ORD-01"
+    name: "CalendarPlanName & Eligible == 'True' Match Guardrail"
+    rule: >
+      Always match SSP_eligibility_final on CalendarPlanName == planName from calendar_plans,
+      filter strictly for Eligible == 'True' and RunId == target_run_id, and extract
+      StoreCode and Reference columns.
+  - id: "GR-ORD-02"
+    name: "Cadence & Active Status Guardrail"
+    rule: >
+      Only run plans where status == 'active'. Inspect `runCadence` comma-separated days
+      and execute on matching scheduled days. If triggered by a user prompt or command,
+      treat it as an authorized manual run and proceed immediately without asking for confirmation.
+  - id: "GR-ORD-03"
+    name: "Replenish-Only Filter Guardrail"
+    rule: >
+      Never emit rows where ReplenishmentQtyToSend == 0. Unreplenished lines must be dropped.
+  - id: "GR-ORD-04"
+    name: "No Warehouse Stock Column in Output"
+    rule: >
+      Do not include the warehouse stock column in the final dispatch output.
+  - id: "GR-ORD-05"
+    name: "Strict Read-Only Input Protection"
+    rule: >
+      Store_Sku_Min_Display_mapping (7491b7c0) and Replenishment Store mapping (e2ff5910)
+      are strictly READ-ONLY. Never write, update, or overwrite them.
+  - id: "GR-ORD-06"
+    name: "Automated Chained Pipeline Continuation Guardrail"
+    rule: >
+      When invoked as part of the replenishment pipeline immediately after REPL-SPE-02,
+      the agent must execute this order allocation playbook automatically using the newly
+      generated RunId and target CalendarPlanName without requesting user confirmation.
+  - id: "GR-ORD-07"
+    name: "Strict Zero Unprogrammed Questions Guardrail"
+    rule: >
+      Never halt or ask the user ad-hoc conversational questions or confirmation dialogs during
+      the replenishment process. Run all calculations to completion and output the final verified dispatch summary.
+  - id: "GR-ORD-08"
+    name: "Mandatory SKU-Size Level Output Guardrail"
+    rule: >
+      Every output table, report, or exported dispatch file must include the Size column.
+      Never omit Size or roll up size-level quantities into Reference-level summaries when outputting resultant allocation data.
+

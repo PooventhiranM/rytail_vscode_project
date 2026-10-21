@@ -1,0 +1,225 @@
+playbook_id: "REPL-ELIG-01"
+playbook_name: "Eligibility Playbook — Replenishment"
+short_name: "eligibility"
+
+description: >
+  Operates ON TOP OF confirmed Calendar Plans (see Calendar/playbook/calender.yml,
+  REPL-CAL-01) — Calendar Plan CRUD and the Store & SKU Minimum Display
+  mapping upload live THERE, not here. This playbook determines which
+  store + product + size rows are eligible for replenishment, for
+  whichever Calendar Plan(s) are due to run on a given day.
+
+  FOLDER SPLIT: Calendar/ handles plan configuration (REPL-CAL-01).
+  Replenishment/ (this folder) handles everything that runs ON TOP of a
+  confirmed plan — this playbook, plus whatever else gets added here
+  later (see Replenishment/skill.md).
+
+  BUILT SO FAR: the scheduling / scope-isolation architecture (below), and
+  the FIRST eligibility rule — the zero-warehouse-stock case (see
+  `computation` below): a plan's warehouse+productFamily-scoped product
+  list, cross-referenced against that warehouse's latest stock snapshot,
+  with Replenishment Qty=0/Confidence=100 for anything at zero stock. The
+  rule for products WITH stock (>0) is still TBD — do not invent it.
+  Sales Threshold / MinDisplay logic and where results ultimately get
+  persisted are also still TBD, defined step by step next.
+
+  MODULE NOTE: this is still the SAME Replenishment module/MCP tool
+  surface as Calendar/skill.md (get_replenishment_dataset_ids, etc.) —
+  Calendar vs Replenishment is an ORGANIZATIONAL folder split (plan
+  config vs logic-on-top), not a second module with its own .env/tools.
+  Still never resolve a dataset ID from an FA-scoped tool (e.g.
+  get_fa_dataset_ids) — same guardrail as Calendar/skill.md.
+
+# ── Scheduling & scope isolation (built) ──
+scheduling:
+  which_plans_run_today: >
+    A Calendar Plan is DUE on a given day if: (1) its LATEST row (ORDER BY
+    rowSeq DESC per planName — see calendar_plans.read_pattern in
+    Calendar/playbook/calender.yml) has status = "active" (draft/archived
+    plans never run), AND (2) its runCadence value contains that day
+    name. Query calendar_plans (ID: a21b4d4b-6edd-4a02-b2e3-d87ba71045ff —
+    confirmed in Calendar/playbook/calender.yml; this playbook does NOT
+    redefine that dataset's schema/ID, it only reads it) to resolve this.
+    There is no dedicated tool for it (see no_new_tool_needed below) —
+    build the query with query_dataset, same convention as calender.yml.
+    If a single query (latest-row-per-planName + status + runCadence
+    filter, e.g. via a self-join on MAX(rowSeq) grouped by planName) turns
+    out awkward against this Domo instance's query engine, it's fine to
+    resolve it in two simpler steps instead (e.g. distinct planNames
+    first, then each one's latest row) — correctness over a single clever
+    query.
+  parallel_execution_meaning: >
+    CONFIRMED (2026-08-27, with Pugal): "parallel" means CORRECTLY SCOPED,
+    INDEPENDENT runs — NOT true concurrent/background execution.
+    mcp_sever 1.py has no scheduler/job-runner; this is a turn-by-turn
+    chat-gate system, same as Calendar's playbook. Two plans due on the
+    same day (e.g. both Monday) are each processed as a fully independent
+    unit, one at a time if needed — the guarantee is that their DATA NEVER
+    BLENDS, not that they execute simultaneously as OS-level parallel
+    processes. True concurrent execution was explicitly considered and
+    ruled out as out of scope for now (would require building
+    scheduler/job-runner infrastructure that doesn't exist anywhere in
+    this project today).
+  scope_isolation_guardrail: >
+    HARD RULE: every query this playbook runs for a given plan's
+    eligibility computation (against performance/product_performance,
+    store_master, that plan's own store_mapping, etc.) MUST filter by
+    THAT plan's own warehouse AND productFamily, and use THAT plan's own
+    storeMappingFileId for its store list — NEVER a query spanning
+    multiple plans' scopes at once, even when several plans share a run
+    day. Concretely: when two plans are due the same day with different
+    warehouses, run each plan's FULL set of eligibility queries
+    separately (WHERE warehouse = '<planA.warehouse>' AND productFamily =
+    '<planA.productFamily>' for plan A's queries; a completely separate
+    set of queries scoped to plan B for plan B) — do not write one
+    combined query across both plans' warehouses and split the results
+    afterward, since that risks silently mixing data between plans that
+    happen to overlap on some dimension (e.g. same productFamily,
+    different warehouse).
+  no_new_tool_needed: >
+    DECIDED (2026-08-27): this does not require a new MCP tool —
+    query_dataset, inspect_schema, and get_replenishment_dataset_ids (all
+    already exist) are sufficient. The requirement above is a
+    QUERY-DISCIPLINE guardrail, not a missing capability. Revisit only if
+    the "which plans run today" query proves too fragile/unreliable to
+    hand-roll every time — a small convenience tool wrapping it could be
+    added later, mirroring why get_fa_dataset_ids/
+    get_replenishment_dataset_ids exist (repeated, error-prone lookups),
+    but that bar hasn't been hit yet.
+
+# ── Eligibility computation (built: zero-stock rule only) ──
+# NOTE: this is a COMPUTATION PIPELINE run per due Calendar Plan (see
+# scheduling.which_plans_run_today), not a chat gate — no user input is
+# collected here beyond what's already resolved from the plan. Column
+# names below were verified live via inspect_schema (2026-08-27), not
+# assumed — see datasets below for the exact confirmed names.
+computation:
+  step_1_plan_scope: >
+    Take warehouse and productFamily directly from the Calendar Plan
+    being processed for this run (e.g. warehouse="H01",
+    productFamily="BOYS CORE DENIM") — already resolved via scheduling,
+    not re-asked here. Every query below is scoped to THESE two values
+    for this one plan, per scheduling.scope_isolation_guardrail — never
+    blend with another plan's warehouse/productFamily even if they share
+    a run day.
+  step_2_warehouse_stock_snapshot: >
+    Dataset: warehouse_invdetails (confirmed_id
+    d5b5b9f9-614f-447a-9cb9-4653fd82af6d — see datasets below). SELECT
+    DISTINCT STORE_CODE, PRODUCT_CODE, STOCK_ONHAND_QTY FROM table WHERE
+    DATE = (SELECT MAX(DATE) FROM table) — the most recent snapshot date
+    only — AND STORE_CODE = '<plan.warehouse>' (e.g. 'H01'). IMPORTANT
+    NAMING GOTCHA: despite the column being literally named STORE_CODE,
+    in THIS warehouse-level dataset it holds WAREHOUSE codes (the same
+    values as calendar_plans.warehouse, themselves store_master rows
+    where Format='Warehouse') — do not confuse this with a retail
+    store's StoreCode used elsewhere (e.g. store_mapping/store_master's
+    per-store rows). The output field is still called "StoreCode" per
+    the requested output_structure below, but it means warehouse here.
+  step_3_product_family_item_codes: >
+    Dataset: product_master (confirmed_id
+    7fb59cab-dd64-4821-a55f-2276d808bfc3 — see datasets below). SELECT
+    DISTINCT `Item Code` FROM table WHERE Family = '<plan.productFamily>'
+    (e.g. 'BOYS CORE DENIM'). CORRECTED 2026-08-27 (live test run for
+    Calendar plan A, warehouse H01/BOYS CORE DENIM): the original
+    instruction said "Barcode", and product_master DOES have a column
+    literally named "Barcode" — but it's a 13-digit EAN value (e.g.
+    "8907546386853"), a completely different identifier space from
+    warehouse_invdetails.PRODUCT_CODE's "ETH######" format (e.g.
+    "ETH954519") — joining on it produced ZERO matches. product_master's
+    "Item Code" column uses that SAME "ETH######" format (e.g.
+    "ETH795333") and produces real matches (verified live) — use Item
+    Code here, NOT Barcode, despite Barcode being the literally-named
+    match to the original instruction's wording. Confirmed with Pugal.
+  step_4_filter_by_item_code: >
+    Filter step_2's output rows to only those whose PRODUCT_CODE is IN
+    the Item Code list from step_3. Result: the warehouse-stock rows that
+    are BOTH in the latest snapshot for this plan's warehouse AND belong
+    to this plan's productFamily. VERIFIED live (2026-08-27, Calendar
+    plan A): warehouse_invdetails.PRODUCT_CODE and product_master.`Item
+    Code` are the same identifier space (both "ETH######") — actually
+    confirmed by a real join producing matching rows, not just assumed.
+  step_5_zero_stock_rule: >
+    For every row from step_4 where STOCK_ONHAND_QTY = 0: ReplenishmentQty
+    = 0, ReplenishmentReason = "No stock in warehouse", ConfidenceScore =
+    100. RULE FOR NON-ZERO STOCK ROWS (STOCK_ONHAND_QTY > 0) IS NOT YET
+    DEFINED — do not invent a ReplenishmentQty/Reason/ConfidenceScore for
+    those rows; per output_structure below they're still included in the
+    output with those three fields left null/pending, not silently
+    dropped and not guessed at.
+  output_structure: >
+    List of {StoreCode (=warehouse code, see step_2 gotcha), ProductCode,
+    StockOnHandQty, ReplenishmentQty, ConfidenceScore, ReplenishmentReason}
+    — one row per step_4 result. For STOCK_ONHAND_QTY=0 rows: per
+    step_5_zero_stock_rule. For STOCK_ONHAND_QTY>0 rows: ReplenishmentQty/
+    ConfidenceScore/ReplenishmentReason = null (rule not defined yet) —
+    UNCONFIRMED whether non-zero rows should even be included at this
+    stage vs. held back until their rule exists; included-with-nulls was
+    chosen as the more useful default (keeps the full candidate universe
+    visible) but flagged here rather than assumed silently.
+  persistence: >
+    NOT YET DEFINED where (or whether) this output gets written to a Domo
+    dataset — no write_to_domo_dataset call exists for this yet. Treat as
+    a computed/returned result only until told otherwise.
+
+# ── Datasets ──
+# calendar_plans is read from Calendar/playbook/calender.yml's definition,
+# not redefined here. Two datasets now confirmed for the zero-stock rule
+# (computation above); performance, store_master, a plan's own
+# store_mapping, and store_sku_min_display_mapping will be added here as
+# further eligibility rules get defined.
+datasets:
+  warehouse_invdetails:
+    alias: "warehouse_invdetails"
+    domo_dataset_name: "SU_Warehouse_Invdetails"
+    confirmed_id: "d5b5b9f9-614f-447a-9cb9-4653fd82af6d"
+    grain: "DATE + STORE_CODE + PRODUCT_CODE (43,993,056 rows, 22 columns — confirmed live via inspect_schema, same as Calendar/playbook/calender.yml's entry for this dataset)"
+    relevant_columns: ["DATE", "STORE_CODE", "PRODUCT_CODE", "STOCK_ONHAND_QTY"]
+    usage_in_this_playbook: >
+      computation.step_2 — latest-snapshot warehouse stock, filtered to
+      this plan's warehouse. STORE_CODE here means WAREHOUSE code, not a
+      retail store (see step_2's naming gotcha).
+  product_master:
+    alias: "product_master"
+    domo_dataset_name: "SU_Product_Master"
+    confirmed_id: "7fb59cab-dd64-4821-a55f-2276d808bfc3"
+    grain: "793,211 rows, 54 columns — confirmed live via inspect_schema 2026-08-27 (fuller than Calendar/playbook/calender.yml's 4-column summary of this same dataset)"
+    relevant_columns: ["Item Code", "Family", "Barcode", "Reference", "Size", "Division"]
+    usage_in_this_playbook: >
+      computation.step_3 — distinct Item Codes (NOT Barcode — see
+      step_3's CORRECTED note) for this plan's productFamily (Family
+      column), used to filter step_2's output at step_4. Barcode is a
+      13-digit EAN, a different identifier space from
+      warehouse_invdetails.PRODUCT_CODE — kept in relevant_columns for
+      reference/visibility only, not used by this computation.
+
+# ── Gates ──
+# TBD — no gates defined yet. The scheduling/scope-isolation rules above
+# apply to whatever gates get built here; they are architecture, not
+# gates themselves.
+gates: []
+
+# ── Structured question format ──
+question_format: >
+  TBD — expected to follow the same convention as
+  Calendar/playbook/calender.yml (one JSON object per gate turn, raw JSON,
+  no code fence/markdown/prose) once gates exist here.
+
+# ── Output schema ──
+output_schema:
+  eligibility_row:
+    StoreCode: "string — the WAREHOUSE code from warehouse_invdetails.STORE_CODE (see computation.step_2's naming gotcha), NOT a retail store code"
+    ProductCode: "string — warehouse_invdetails.PRODUCT_CODE ('ETH######' format), filtered to product_master.`Item Code` values (same format — NOT Barcode, a different EAN identifier space) in this plan's productFamily"
+    StockOnHandQty: "number — warehouse_invdetails.STOCK_ONHAND_QTY as of the latest snapshot DATE for this warehouse"
+    ReplenishmentQty: "number — 0 when StockOnHandQty=0 (computation.step_5_zero_stock_rule). null when StockOnHandQty>0 (rule not defined yet)."
+    ConfidenceScore: "number, 0-100 scale — 100 when StockOnHandQty=0. null when StockOnHandQty>0 (rule not defined yet)."
+    ReplenishmentReason: "string — \"No stock in warehouse\" when StockOnHandQty=0. null when StockOnHandQty>0 (rule not defined yet)."
+
+guardrails:
+  - "MODULE NOTE: same Replenishment MCP tool surface as Calendar/skill.md — Calendar vs Replenishment is a folder/organizational split (plan config vs logic-on-top), not two separate modules. Never call an FA-scoped tool (e.g. get_fa_dataset_ids) or reuse an FA dataset ID here either."
+  - "Never invent a dataset UUID for calendar_plans or anything else — resolve it via get_replenishment_dataset_ids / Calendar/playbook/calender.yml, the same as that playbook does."
+  - "Scope isolation (see scheduling.scope_isolation_guardrail) is the single most important rule in this file so far: never let two plans' warehouse/productFamily/store scopes blend in one query, even when they share a run day. This is the CONFIRMED concrete meaning of \"parallel\" for this playbook — not assumed, checked with Pugal."
+  - "This playbook does not redefine calendar_plans' schema/ID/read_pattern — Calendar/playbook/calender.yml is the source of truth for that dataset; this file only reads it."
+  - "Do not build eligibility RULES ahead of being told them. Confirmed/built so far: the scheduling/scope-isolation architecture, and the zero-warehouse-stock rule (computation.step_5_zero_stock_rule) ONLY. Sales Threshold, MinDisplay logic, and the non-zero-stock ReplenishmentQty rule are all still TBD — do not invent values for them, leave those fields null per output_schema."
+  - "warehouse_invdetails.STORE_CODE means WAREHOUSE code in this dataset, not a retail store — never confuse it with store_master/store_mapping's per-store StoreCode when building queries or reporting results (see computation.step_2's naming gotcha)."
+  - "Where (or whether) computation output gets persisted to a Domo dataset is NOT YET DEFINED — no write_to_domo_dataset call exists for this playbook. Do not invent a destination dataset or call create_domo_dataset/write_to_domo_dataset here without being told to."
+  - "product_master.Barcode and product_master.\"Item Code\" are BOTH real columns but different identifier spaces (13-digit EAN vs 'ETH######') — only Item Code matches warehouse_invdetails.PRODUCT_CODE, verified via a live test run (2026-08-27, Calendar plan A). A literally-matching column name is not proof it's the right join key — this was caught by actually running the pipeline and getting zero results, not by inspection alone."
